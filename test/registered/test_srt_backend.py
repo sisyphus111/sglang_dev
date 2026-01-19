@@ -17,7 +17,7 @@ from sglang.test.test_programs import (
     test_stream,
     test_tool_use,
 )
-from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, CustomTestCase
+from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
 register_cuda_ci(est_time=80, suite="stage-a-test-1")
 register_amd_ci(est_time=120, suite="stage-a-test-1")
@@ -29,7 +29,7 @@ class TestSRTBackend(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.backend = sgl.Runtime(
-            model_path=DEFAULT_MODEL_NAME_FOR_TEST, cuda_graph_max_bs=4
+            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST, cuda_graph_max_bs=4
         )
         sgl.set_default_backend(cls.backend)
 
@@ -75,7 +75,8 @@ class TestSRTBackend(CustomTestCase):
         # Run twice to capture more bugs
         for _ in range(2):
             accuracy, latency = test_hellaswag_select()
-            self.assertGreater(accuracy, 0.60)
+            # Lower threshold for 1B model (vs 0.60 for 8B model)
+            self.assertGreater(accuracy, 0.45)
 
     def test_gen_min_new_tokens(self):
         test_gen_min_new_tokens()
