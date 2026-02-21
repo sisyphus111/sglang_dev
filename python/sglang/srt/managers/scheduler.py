@@ -726,6 +726,7 @@ class Scheduler(
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
+            # 接收来自 ZMQ 的消息
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
 
@@ -982,6 +983,7 @@ class Scheduler(
                     src=self.attn_tp_group.ranks[0],
                 )
             if self.tp_size != 1:
+                # 开启 TP 时，rank0 需要将这个接收到的请求同步给其它 rank
                 control_reqs = broadcast_pyobj(
                     control_reqs,
                     self.tp_group.rank,
@@ -1388,22 +1390,26 @@ class Scheduler(
         )
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        # 【调度核心入口】：负责清理上一轮状态，决定下一步是运行 Prefill 还是 Decode，并组装批次
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
         if self.chunked_req:
             # Move the chunked request out of the batch so that we can merge
             # only finished requests to running_batch.
+            # 将未完成的 chunked_req 移出，以便后续只把真正完成的请求合并到 running_batch 中
             chunked_req_to_exclude.add(self.chunked_req)
             self.tree_cache.cache_unfinished_req(self.chunked_req)
             # chunked request keeps its rid but will get a new req_pool_idx
             self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
         if self.last_batch and self.last_batch.forward_mode.is_extend():
+            # 如果上一轮是 Prefill (extend) 批次，需要清理并将其未完成的部分合并到 Decode (running) 批次中
             if self.last_batch.chunked_req is not None:
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                 # We need to discard it.
                 chunked_req_to_exclude.add(self.last_batch.chunked_req)
 
             # Filter batch
+            # 过滤剔除掉在 Prefill 阶段就已经结束（比如刚好输出完了）的请求
             last_bs = self.last_batch.batch_size()
             self.last_batch.filter_batch(
                 chunked_req_to_exclude=list(chunked_req_to_exclude)
@@ -1412,6 +1418,7 @@ class Scheduler(
                 self.running_batch.batch_is_full = False
 
             # Merge the new batch into the running batch
+            # 将过滤后剩余的、需要继续生成的请求，合并到统一维护持续生成任务的 running_batch 中
             if not self.last_batch.is_empty():
                 if self.running_batch.is_empty():
                     self.running_batch = self.last_batch
@@ -1419,6 +1426,7 @@ class Scheduler(
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
 
+        # 尝试从等待队列(waiting_queue)中拉取新请求，分配显存，组装一个新的 Prefill 批次
         new_batch = self.get_new_batch_prefill()
 
         need_dp_attn_preparation = require_mlp_sync(self.server_args)
@@ -1431,10 +1439,13 @@ class Scheduler(
 
         if new_batch is not None:
             # Run prefill first if possible
+            # 策略：Prefill 优先。如果成功组装了新批次，本轮直接返回去执行 Prefill
             ret = new_batch
         else:
             # Run decode
+            # 策略转为 Decode：如果无法获取新请求（比如显存已饱和，或队列为空），则去处理已经积攒在 running_batch 中的 Decode 任务
             if not self.running_batch.is_empty():
+                # 准备 Decode 批次，内部会检查显存是否不足(OOM)。若不足会触发 Retract(抢占机制)，强行退回部分请求以保全其他请求
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
@@ -1659,7 +1670,9 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
+            # 【Speculative Decoding 分岔口】：判断是否开启了推测解码(如EAGLE)
             if self.spec_algorithm.is_none():
+                # ------------------- 正常自回归解码路径 -------------------
                 model_worker_batch = batch.get_model_worker_batch()
 
                 # update the consumer index of hicache to the running batch
@@ -1676,6 +1689,10 @@ class Scheduler(
                     )
                 bid = model_worker_batch.bid
             else:
+                # ------------------- 推测解码(Speculative Decoding)路径 -------------------
+                # 将该 batch 交给草稿模型/推测解码 worker 执行。
+                # draft_worker 会在内部执行推测生成(draft)并由目标模型进行验证(verify)。
+                # 返回的核心数据除了 next_token 以外，还包括 num_accepted_tokens(本轮被验证接受的 token 数量)
                 (
                     logits_output,
                     next_token_ids,
@@ -1684,8 +1701,12 @@ class Scheduler(
                     can_run_cuda_graph,
                 ) = self.draft_worker.forward_batch_speculative_generation(batch)
                 bs = batch.batch_size()
+                
+                # 统计推测解码的接受率指标 (accepted tokens)
                 self.spec_num_total_accepted_tokens += num_accepted_tokens + bs
                 self.spec_num_total_forward_ct += bs
+                
+                # 更新本轮总共生成的 token 数量(注意推测解码一轮可能吐出多个 token)
                 self.num_generated_tokens += num_accepted_tokens
 
             if self.pp_group.is_last_rank:

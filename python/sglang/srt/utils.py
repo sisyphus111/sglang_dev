@@ -1052,6 +1052,7 @@ def broadcast_pyobj(
     """Broadcast inputs from src rank to all other ranks with torch.dist backend.
     The `rank` here refer to the source rank on global process group (regardless
     of dist_group argument).
+    该函数用于广播 python 对象，本质上通过 torch.distributed API 实现
     """
     device = torch.device(
         "cuda" if torch.cuda.is_available() and not force_cpu_device else "cpu"

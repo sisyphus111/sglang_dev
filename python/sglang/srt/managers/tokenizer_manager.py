@@ -449,6 +449,7 @@ class TokenizerManager:
             ]
         )
 
+    # “处理一个请求”的顶层函数：tokenize -> send to scheduler -> wait for response
     async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -469,8 +470,11 @@ class TokenizerManager:
 
         async with self.model_update_lock.reader_lock:
             if obj.is_single:
+                # 将文本转为 token_id
                 tokenized_obj = await self._tokenize_one_request(obj)
+                # 发送请求给 Scheduler
                 state = self._send_one_request(obj, tokenized_obj, created_time)
+                # 等待结果
                 async for response in self._wait_one_response(obj, state, request):
                     yield response
             else:
@@ -509,6 +513,7 @@ class TokenizerManager:
                     "accept text prompts. Please provide input_ids or re-initialize "
                     "the engine with skip_tokenizer_init=False."
                 )
+            # 调用 HuggingFace Tokenizer, 分词并转为 token_id
             encoded = self.tokenizer(
                 input_text, return_token_type_ids=is_cross_encoder_request
             )
@@ -716,7 +721,9 @@ class TokenizerManager:
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
         created_time: Optional[float] = None,
     ):
+        # 使用 ZMQ (zmq.PUSH) 发送 Python 对象
         self.send_to_scheduler.send_pyobj(tokenized_obj)
+        # 维护本地请求状态，用于后续匹配结果
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
         self.rid_to_state[obj.rid] = state
         return state

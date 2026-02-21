@@ -284,12 +284,20 @@ class PrefillAdder:
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.running_batch = running_batch
+        # new_token_ratio: 这是一个动态衰减的“折损率/超分比例”系数，用于控制计算显存预算时的严苛程度。
+        # 很多请求其实根本跑不到 max_new_tokens 就会提前结束(EOS)。如果全按 max_new 预留显存，会导致系统并发量(吞吐)极低。
+        # 因此，系统会用 (max_new_tokens * new_token_ratio) 来作为【预计要消耗】的显存。
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - mixed_with_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
         if self.rem_chunk_tokens is not None:
             self.rem_chunk_tokens -= mixed_with_decode_tokens
 
+        # rem_total_token_offset: "已承诺的显存债务 (Committed Token Budget / Debt)"
+        # 物理显存池 (kv_pool) 里的 available_size 是当前的绝对空闲量，但调度器需要为“未来”做规划。
+        # 当我们把一个请求放进批次时，它不仅需要消耗当前的 Prompt 长度，未来还会不断吐字消耗新的空间。
+        # 这个 offset 变量记录了：我们已经向当前批次里的请求“承诺/预留”了多少个 token 槽位。
+        # 算最终真正可用的逻辑额度 (rem_total_tokens) 时，就是拿当前的物理空闲量减去这个 offset 债务。
         self.rem_total_token_offset = mixed_with_decode_tokens
         self.cur_rem_token_offset = mixed_with_decode_tokens
 
@@ -301,6 +309,8 @@ class PrefillAdder:
         self.log_input_tokens = 0
 
         if running_batch is not None:
+            # 初始化记账员时，计算正在跑的 running_batch 里的老请求们“未来预计还会消耗多少显存”。
+            # 这里的计算直接用到了 new_token_ratio 进行打折预估，而不是傻傻地预留全量的 max_new_tokens。
             self.rem_total_token_offset += sum(
                 [
                     min(
@@ -420,6 +430,8 @@ class PrefillAdder:
             return AddReqResult.NO_TOKEN
 
         def add_req_state(r, insert_sort=False):
+            # 对设置了 ignore_eos=True 的请求，必须严格老老实实按 1.0 的满额去预留，因为它们肯定会跑到 max_new_tokens
+            # 对普通请求，使用 new_token_ratio 比例打折来预估它未来还会生成多少 token
             new_token_ratio = (
                 1.0 if r.sampling_params.ignore_eos else self.new_token_ratio
             )
@@ -493,50 +505,70 @@ class PrefillAdder:
         return self.budget_state()
 
     def add_one_req(self, req: Req, has_chunked_req: bool):
+        # 【核心功能】：尝试将一个请求加入到当前的 Prefill 批次中。内部进行显存预算和算力预算的双重校验。
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req, has_chunked_req)
 
+        # 1. 预估该请求所需的总 KV Cache 数量 (用于显存约束)
+        # = 还需要处理的输入长度(extend_input_len) + 预计会生成的输出长度(max_new_tokens，并做了防爆截断)
         total_tokens = req.extend_input_len + min(
             req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION
         )
 
+        # 2. 计算实际需要耗费算力的 Input Tokens (用于算力约束)
         # adjusting the input_tokens based on host_hit_length and page_size
+        # 如果命中了一些在 Host (CPU) 内存上的缓存，由于只需要传输(加载回GPU)而无需重新计算，可以减去
         real_input_tokens = req.extend_input_len - req.host_hit_length
+        # 向上对齐到 page_size (因为底层内存池按页分配)
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
 
+        # 3. 粗略的第一次检查：
+        # 如果预估总显存开销超过了系统剩余可用总显存(rem_total_tokens)，拒绝(NO_TOKEN)
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
 
+        # 如果实际算力开销超过了单次 Prefill 允许的 Token 阈值上限(rem_input_tokens)，
+        # 且当前批次里已经有其他请求了(len != 0)，说明装不下了，放到下一批(OTHER)
         if real_input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
             return AddReqResult.OTHER
 
+        # 4. 锁定相关节点，准备正式接纳
         with self._lock_node(req.last_node):
+            # 锁定节点可能会触发别的内部驱逐操作，导致可用显存减少，因此加锁后再检查一次
             # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
 
+            # 如果存在命中在 Host 内存里的缓存，启动从 Host 到 GPU 的加载操作
             if req.host_hit_length > 0:
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     req.last_host_node, req.host_hit_length
                 )
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
+                # 重新计算剩余真正需要计算的前向 token 长度
                 req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
                 prefix_len = len(req.prefix_indices)
 
+            # 重新计算向上取整后的、精确的算力消耗
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
+            # 再做一次精确的算力开销检查
             if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
                 return AddReqResult.OTHER
 
+            # 5. 分配：根据是否触发 Chunked Prefill 分为两种情况
             if self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
-                # Non-chunked prefill
+                # 情况A: Non-chunked prefill (完整装入)
+                # 未开启 chunked 机制，或者开启了但是当前这个请求能被完全塞进本轮 chunk 预算里
                 self.can_run_list.append(req)
                 if self.is_hybrid:
                     swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
                     req.swa_uuid_for_lock = swa_uuid_for_lock
                 else:
                     self.tree_cache.inc_lock_ref(req.last_node)
+                
+                # 扣除相应的预算 (算力预算扣除 input_tokens，显存预算扣除 input + max_new)
                 self._update_prefill_budget(
                     prefix_len,
                     input_tokens,
@@ -546,15 +578,20 @@ class PrefillAdder:
                     ),
                 )
             else:
-                # Make sure at least one page is available
+                # 情况B: Chunked prefill (切块装入)
+                # 该请求的长度超过了本轮还能塞下的 chunk 预算，必须进行切断 (Truncate)
+                
+                # Make sure at least one page is available (确保截断后至少能有1个完整 page 的空间)
                 trunc_len = self.rem_chunk_tokens - self.page_size + 1
                 if trunc_len <= 0:
+                    # 如果连一点点空间都挤不出了，就不要切了，直接放到下一轮
                     return AddReqResult.OTHER
 
-                # Chunked prefill
+                # 执行截断，修改请求内部游标
                 req.extend_input_len = trunc_len
                 req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
 
+                # 将截断后的请求加入批次，同时将其标记为新的 chunked_req (以便下一轮继续算它剩下的部分)
                 self.can_run_list.append(req)
                 self.new_chunked_req = req
                 if self.is_hybrid:
@@ -562,6 +599,10 @@ class PrefillAdder:
                     req.swa_uuid_for_lock = swa_uuid_for_lock
                 else:
                     self.tree_cache.inc_lock_ref(req.last_node)
+                
+                # 扣除相应的预算：只扣除本次计算的部分 (trunc_len)；
+                # 注意 max_new_tokens 传入了 0，因为没算完，还没到分配输出显存的时候
                 self._update_prefill_budget(prefix_len, trunc_len, 0)
 
+        # 6. 最后检查状态，判断当前大批次是否已满，返回 CONTINUE(还可以接着装) 或者 NO_TOKEN/OTHER(满了)
         return self.budget_state()

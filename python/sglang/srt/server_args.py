@@ -2040,7 +2040,8 @@ class PortArgs:
             nccl_port = server_args.nccl_port
 
         if not server_args.enable_dp_attention:
-            # Normal case, use IPC within a single node
+            # Normal case, use IPC within a single node 单机模式
+            # 使用 Python 内置库 tempFile 在 /tmp 目录下创建一个随机名字的空白文件，并以这恶鬼名字作为 ZMQ 的 IPC 端点
             return PortArgs(
                 tokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
@@ -2050,6 +2051,7 @@ class PortArgs:
                 metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
             )
         else:
+            # 跨机器时，不同进程跑在多个结点上，需要走 tcp —— 需要按照某种方式分配端口
             # DP attention. Use TCP + port to handle both single-node and multi-node.
             if server_args.nnodes == 1 and server_args.dist_init_addr is None:
                 dist_init_addr = ("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)

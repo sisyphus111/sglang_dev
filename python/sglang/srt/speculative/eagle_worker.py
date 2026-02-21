@@ -66,6 +66,12 @@ def draft_tp_context(tp_group: GroupCoordinator):
 
 
 class EAGLEWorker(TpModelWorker):
+    # EAGLEWorker 是 Speculative Decoding (推测解码) 的具体执行引擎。
+    # 它本身继承自 TpModelWorker，这意味着它也是一个可以独立执行前向传播的 Worker。
+    # 
+    # 1. 它的内部持有了 target_worker (主模型 / Target Model)。
+    # 2. 它在初始化时创建了一个 draft_model_runner (草稿模型 / Draft Model)。
+    # 3. 当 run_batch 调用它时，它会在内部协调：让草稿模型飞速生成多个 token (Draft)，然后让主模型一次性验证 (Verify)。
 
     def __init__(
         self,
