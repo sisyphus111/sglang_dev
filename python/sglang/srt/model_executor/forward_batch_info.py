@@ -143,7 +143,7 @@ class CaptureHiddenMode(IntEnum):
     NULL = 0
     # Capture a hidden state of the last token.
     LAST = 1
-    # Capture hidden states of all tokens.
+    # Capture hidden states of all tokens. 适用场景：extend(prefill)阶段，用 target 的 hidden states 给 eagle3 draft 建 KVCache
     FULL = 2
 
     def need_capture(self):

@@ -615,6 +615,7 @@ class EAGLEWorker(TpModelWorker):
         # Forward multiple steps
         scores = None
         for i in range(self.speculative_num_steps):
+            # 让草稿头前向 n 步，每步选 top_k 个 token
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
