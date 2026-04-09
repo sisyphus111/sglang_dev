@@ -32,6 +32,7 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.speculative.decoupled_spec_io import DraftBackendIpcConfig
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
@@ -1052,7 +1053,11 @@ class ServerArgs:
                 if self.speculative_algorithm == "STANDALONE":
                     # standalonedraft model and cuda graphs
                     reserved_mem += 6 * 1024
-                elif self.speculative_algorithm != "NGRAM":
+                elif self.speculative_algorithm not in (
+                    "NGRAM",
+                    "DECOUPLED_VERIFY",
+                    "DECOUPLED_DRAFT",
+                ):
                     # eagle draft models and cuda graphs
                     reserved_mem += 2 * 1024
 
@@ -2351,6 +2356,54 @@ class ServerArgs:
 
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
+
+        if self.speculative_algorithm in ("DECOUPLED_VERIFY", "DECOUPLED_DRAFT"):
+            if self.enable_dp_attention:
+                raise ValueError(
+                    "decoupled speculative decoding does not support dp attention in phase 1."
+                )
+
+            if self.max_running_requests is None:
+                self.max_running_requests = 48
+                logger.warning(
+                    "Max running requests is reset to 48 for decoupled speculative decoding. "
+                    "You can override this by explicitly setting --max-running-requests."
+                )
+
+            if not self.disable_overlap_schedule:
+                logger.warning(
+                    "Overlap scheduler is disabled for decoupled speculative decoding."
+                )
+            self.disable_overlap_schedule = True
+
+            if self.enable_mixed_chunk:
+                self.enable_mixed_chunk = False
+                logger.warning(
+                    "Mixed chunked prefill is disabled for decoupled speculative decoding."
+                )
+
+            if self.speculative_num_steps is None:
+                raise ValueError(
+                    "decoupled speculative decoding requires speculative_num_steps to be set."
+                )
+
+            if (
+                self.speculative_eagle_topk is not None
+                and self.speculative_eagle_topk != 1
+            ):
+                raise ValueError(
+                    "decoupled speculative decoding currently only supports speculative_eagle_topk == 1."
+                )
+            self.speculative_eagle_topk = 1
+
+            expected_num_draft_tokens = self.speculative_num_steps + 1
+            if self.speculative_num_draft_tokens != expected_num_draft_tokens:
+                logger.warning(
+                    "speculative_num_draft_tokens is adjusted to speculative_num_steps + 1 "
+                    "for decoupled speculative decoding."
+                )
+                self.speculative_num_draft_tokens = expected_num_draft_tokens
+            return
 
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
             if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
@@ -3924,7 +3977,15 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
+            choices=[
+                "EAGLE",
+                "EAGLE3",
+                "NEXTN",
+                "STANDALONE",
+                "NGRAM",
+                "DECOUPLED_VERIFY",
+                "DECOUPLED_DRAFT",
+            ],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -5617,6 +5678,9 @@ class PortArgs:
     # The ipc filename for Tokenizer and worker tokenizer
     tokenizer_worker_ipc_name: Optional[str]
 
+    # The ipc endpoints between verifier scheduler and draft backend
+    draft_backend_ipc_config: Optional[DraftBackendIpcConfig]
+
     @staticmethod
     def init_new(
         server_args: ServerArgs,
@@ -5635,6 +5699,10 @@ class PortArgs:
                 f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
             )
 
+        draft_backend_ipc_config = None
+        if server_args.speculative_algorithm == "DECOUPLED_VERIFY":
+            draft_backend_ipc_config = DraftBackendIpcConfig.init_new(server_args.dp_size)
+
         if not server_args.enable_dp_attention:
             # Normal case, use IPC within a single node
             return PortArgs(
@@ -5645,6 +5713,7 @@ class PortArgs:
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
+                draft_backend_ipc_config=draft_backend_ipc_config,
             )
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
@@ -5699,6 +5768,7 @@ class PortArgs:
                 rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_port}",
                 metrics_ipc_name=f"tcp://{dist_init_host}:{metrics_ipc_name}",
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
+                draft_backend_ipc_config=draft_backend_ipc_config,
             )
 
 

@@ -70,6 +70,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     parse_remote_instance_transfer_engine_info_from_scheduler_infos,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -135,12 +136,28 @@ class Engine(EngineBase):
     init_tokenizer_manager_func: Callable = staticmethod(init_tokenizer_manager)
     run_scheduler_process_func: Callable = staticmethod(run_scheduler_process)
     run_detokenizer_process_func: Callable = staticmethod(run_detokenizer_process)
+    run_draft_backend_func: Optional[Callable] = None
+    run_drafter_scheduler_process_func: Optional[Callable] = None
 
     def __init__(self, **kwargs):
         """
         The arguments of this function is the same as `sglang/srt/server_args.py::ServerArgs`.
         Please refer to `ServerArgs` for the documentation.
         """
+
+        draft_backend_process_kwargs = dict(
+            kwargs.pop("draft_backend_process_kwargs", {}) or {}
+        )
+        draft_actor_names = kwargs.pop("draft_actor_names", None)
+        draft_actor_namespace = kwargs.pop("draft_actor_namespace", None)
+        if draft_actor_names is not None:
+            draft_backend_process_kwargs.setdefault(
+                "draft_actor_names", list(draft_actor_names)
+            )
+        if draft_actor_namespace is not None:
+            draft_backend_process_kwargs.setdefault(
+                "draft_actor_namespace", draft_actor_namespace
+            )
 
         # Parse server_args
         if "server_args" in kwargs:
@@ -155,6 +172,26 @@ class Engine(EngineBase):
         self.server_args = server_args
         logger.info(f"{server_args=}")
 
+        spec_algorithm = SpeculativeAlgorithm.from_string(
+            server_args.speculative_algorithm
+        )
+        run_draft_backend_func = self.run_draft_backend_func
+        if spec_algorithm.is_decoupled_verify() and run_draft_backend_func is None:
+            from sglang.srt.speculative.draft_proxy import run_draft_backend_process
+
+            run_draft_backend_func = run_draft_backend_process
+
+        run_drafter_scheduler_process_func = self.run_drafter_scheduler_process_func
+        if (
+            spec_algorithm.is_decoupled_draft()
+            and run_drafter_scheduler_process_func is None
+        ):
+            from sglang.srt.speculative.draft_scheduler import (
+                run_drafter_scheduler_process,
+            )
+
+            run_drafter_scheduler_process_func = run_drafter_scheduler_process
+
         # Shutdown the subprocesses automatically when the program exits
         atexit.register(self.shutdown)
 
@@ -165,6 +202,9 @@ class Engine(EngineBase):
                 init_tokenizer_manager_func=self.init_tokenizer_manager_func,
                 run_scheduler_process_func=self.run_scheduler_process_func,
                 run_detokenizer_process_func=self.run_detokenizer_process_func,
+                run_draft_backend_func=run_draft_backend_func,
+                run_drafter_scheduler_process_func=run_drafter_scheduler_process_func,
+                draft_backend_process_kwargs=draft_backend_process_kwargs,
             )
         )
         self.tokenizer_manager = tokenizer_manager
@@ -1010,11 +1050,47 @@ def _launch_scheduler_processes(
     return scheduler_procs, scheduler_pipe_readers
 
 
+def _launch_draft_backend_process(
+    server_args: ServerArgs,
+    port_args: PortArgs,
+    run_draft_backend_func: Callable,
+    draft_backend_process_kwargs: Optional[dict] = None,
+) -> mp.Process:
+    reader, writer = mp.Pipe(duplex=False)
+    proc = mp.Process(
+        target=run_draft_backend_func,
+        kwargs=dict(
+            server_args=server_args,
+            port_args=port_args,
+            pipe_writer=writer,
+            **(draft_backend_process_kwargs or {}),
+        ),
+    )
+    proc.start()
+
+    try:
+        data = reader.recv()
+    except EOFError:
+        logger.error("Draft backend process exited before signaling readiness.")
+        proc.join()
+        logger.error(f"Exit code: {proc.exitcode}")
+        raise
+
+    if data.get("status") != "ready":
+        proc.join()
+        raise RuntimeError("Draft backend initialization failed.")
+
+    return proc
+
+
 def _launch_subprocesses(
     server_args: ServerArgs,
     init_tokenizer_manager_func: Callable,
     run_scheduler_process_func: Callable,
     run_detokenizer_process_func: Callable,
+    run_draft_backend_func: Optional[Callable] = None,
+    run_drafter_scheduler_process_func: Optional[Callable] = None,
+    draft_backend_process_kwargs: Optional[dict] = None,
     port_args: Optional[PortArgs] = None,
 ) -> Tuple[TokenizerManager, TemplateManager, Tuple[Dict], PortArgs]:
     """
@@ -1029,6 +1105,14 @@ def _launch_subprocesses(
     if port_args is None:
         port_args = PortArgs.init_new(server_args)
     logger.info(f"{server_args=}")
+
+    spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+    if spec_algorithm.is_decoupled_draft():
+        if run_drafter_scheduler_process_func is None:
+            raise ValueError(
+                "decoupled_draft requires run_drafter_scheduler_process_func to be configured"
+            )
+        run_scheduler_process_func = run_drafter_scheduler_process_func
 
     # Launch scheduler processes
     scheduler_procs, scheduler_pipe_readers = _launch_scheduler_processes(
@@ -1082,6 +1166,18 @@ def _launch_subprocesses(
 
     # Wait for the model to finish loading
     scheduler_infos = _wait_for_scheduler_ready(scheduler_pipe_readers, scheduler_procs)
+
+    if spec_algorithm.is_decoupled_verify() and server_args.node_rank == 0:
+        if run_draft_backend_func is None:
+            raise ValueError(
+                "decoupled_verify requires run_draft_backend_func to be configured"
+            )
+        _launch_draft_backend_process(
+            server_args=server_args,
+            port_args=port_args,
+            run_draft_backend_func=run_draft_backend_func,
+            draft_backend_process_kwargs=draft_backend_process_kwargs,
+        )
 
     # Get back some info from scheduler to tokenizer_manager
     tokenizer_manager.max_req_input_len = scheduler_infos[0]["max_req_input_len"]

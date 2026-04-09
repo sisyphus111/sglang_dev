@@ -182,6 +182,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTen
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
+from sglang.srt.speculative.decoupled_spec_io import DraftBackendClient
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.tracing.trace import (
     process_tracing_init,
@@ -420,6 +421,7 @@ class Scheduler(
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.Context(2)
         self.idle_sleeper = None
+        self.draft_backend_client = None
 
         if self.pp_rank == 0 and self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
@@ -446,6 +448,17 @@ class Scheduler(
             self.send_to_tokenizer = SenderWrapper(send_to_tokenizer)
             self.send_to_detokenizer = SenderWrapper(send_to_detokenizer)
 
+            if self.spec_algorithm.is_decoupled_verify():
+                ipc_config = port_args.draft_backend_ipc_config
+                if ipc_config is None:
+                    raise RuntimeError(
+                        "Draft backend IPC config is required on decoupled_verify entry rank"
+                    )
+                endpoints = ipc_config.get_endpoints(self.dp_rank)
+                self.draft_backend_client = DraftBackendClient.create(
+                    context, endpoints
+                )
+
             if self.server_args.sleep_on_idle:
                 self.idle_sleeper = IdleSleeper(
                     [
@@ -467,6 +480,10 @@ class Scheduler(
     def init_tokenizer(self):
         server_args = self.server_args
         self.is_generation = self.model_config.is_generation
+        if self.spec_algorithm.is_decoupled_verify() and not self.is_generation:
+            raise ValueError(
+                "decoupled_verify only supports generation models in phase 1."
+            )
 
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
@@ -548,6 +565,8 @@ class Scheduler(
             attn_cp_rank=self.attn_cp_rank,
             moe_dp_rank=self.moe_dp_rank,
         )
+        if self.spec_algorithm.is_decoupled_verify():
+            draft_worker_kwargs["draft_backend_client"] = self.draft_backend_client
 
         if self.server_args.speculative_draft_load_format is not None:
             self.server_args.load_format = (
@@ -758,6 +777,32 @@ class Scheduler(
         self.sessions: Dict[str, Session] = {}
         self.forward_sleep_time = None
         self._engine_paused = False
+
+    def _maybe_prepare_decoupled_verify_batch(self, batch: ScheduleBatch) -> None:
+        if not self.spec_algorithm.is_decoupled_verify():
+            return
+        prepare_hook = getattr(self.model_worker, "prepare_verify_batch", None)
+        if prepare_hook is not None:
+            prepare_hook(batch, self)
+
+    def _maybe_after_process_decoupled_verify_batch(
+        self,
+        batch: ScheduleBatch,
+        result: Union[GenerationBatchResult, EmbeddingBatchResult],
+    ) -> None:
+        del result
+        if not self.spec_algorithm.is_decoupled_verify():
+            return
+        post_hook = getattr(self.model_worker, "after_process_batch", None)
+        if post_hook is not None:
+            post_hook(batch, self)
+
+    def _maybe_abort_decoupled_verify_request(self, request_id: str) -> None:
+        if not self.spec_algorithm.is_decoupled_verify():
+            return
+        abort_hook = getattr(self.model_worker, "abort_request_state", None)
+        if abort_hook is not None:
+            abort_hook(request_id)
 
     def init_chunked_prefill(self):
         # Init chunked prefill
@@ -2299,6 +2344,8 @@ class Scheduler(
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
 
+        self._maybe_prepare_decoupled_verify_batch(batch)
+
         # Run forward
         if self.is_generation:
             if self.spec_algorithm.is_none() or self.enable_overlap:
@@ -2462,6 +2509,7 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             self.process_batch_result_idle(batch, result)
 
+        self._maybe_after_process_decoupled_verify_batch(batch, result)
         self.log_batch_result_stats(batch, result)
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
@@ -2748,6 +2796,7 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            self._maybe_abort_decoupled_verify_request(req.rid)
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
