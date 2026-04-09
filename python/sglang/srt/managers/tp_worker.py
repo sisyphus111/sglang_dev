@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List, Optional
 
@@ -453,6 +454,7 @@ class TpModelWorker(BaseTpWorker):
             return self._forward_batch_generation_dllm(forward_batch)
 
         if self.pp_group.is_last_rank:
+            forward_start = time.perf_counter()
             out = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
@@ -506,19 +508,78 @@ class TpModelWorker(BaseTpWorker):
                         logits_output, model_worker_batch
                     )
 
+            forward_time_ms = self._measure_forward_time_ms(forward_start)
+            self._log_decoupled_draft_graph_status(
+                forward_batch=forward_batch,
+                can_run_cuda_graph=can_run_cuda_graph,
+                forward_time_ms=forward_time_ms,
+            )
             return batch_result
         else:
+            forward_start = time.perf_counter()
             out = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
                 skip_attn_backend_init=skip_attn_backend_init,
             )
             pp_proxy_tensors, can_run_cuda_graph = out.logits_output, out.can_run_graph
+            forward_time_ms = self._measure_forward_time_ms(forward_start)
+            self._log_decoupled_draft_graph_status(
+                forward_batch=forward_batch,
+                can_run_cuda_graph=can_run_cuda_graph,
+                forward_time_ms=forward_time_ms,
+            )
             return GenerationBatchResult(
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
             )
+
+    def _is_entry_rank(self) -> bool:
+        return self.pp_rank == 0 and self.tp_rank == 0 and self.attn_cp_rank == 0
+
+    def _measure_forward_time_ms(self, forward_start: float) -> float:
+        if str(self.device).startswith("cuda"):
+            torch.cuda.synchronize()
+        return (time.perf_counter() - forward_start) * 1000.0
+
+    def _log_decoupled_draft_graph_status(
+        self,
+        forward_batch: ForwardBatch,
+        can_run_cuda_graph: bool,
+        forward_time_ms: float,
+    ) -> None:
+        if (
+            not self._is_entry_rank()
+            or not self.model_runner.spec_algorithm.is_decoupled_draft()
+        ):
+            return
+
+        is_decode = forward_batch.forward_mode.is_decode()
+        is_extend = forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+        if not is_decode and not is_extend:
+            return
+
+        mode = "decode" if is_decode else "prefill"
+        graph_backend = "cuda_graph" if is_decode else "piecewise_cuda_graph"
+        has_graph_runner = self.model_runner.graph_runner is not None
+        has_piecewise_graph_runner = (
+            self.model_runner.piecewise_cuda_graph_runner is not None
+        )
+        # print(
+        #     "[decoupled-draft-worker] "
+        #     f"mode={mode} "
+        #     f"graph_backend={graph_backend} "
+        #     f"graph_hit={bool(can_run_cuda_graph)} "
+        #     f"has_cuda_graph_runner={has_graph_runner} "
+        #     f"has_piecewise_cuda_graph_runner={has_piecewise_graph_runner} "
+        #     f"disable_cuda_graph={bool(self.model_runner.server_args.disable_cuda_graph)} "
+        #     f"enable_piecewise_cuda_graph={bool(self.model_runner.server_args.enable_piecewise_cuda_graph)} "
+        #     f"forward_time_ms={forward_time_ms:.3f} "
+        #     f"batch_size={forward_batch.batch_size} "
+        #     f"seq_lens_sum={int(forward_batch.seq_lens.sum().item()) if forward_batch.seq_lens is not None else 0}",
+        #     flush=True,
+        # )
 
     def forward_batch_split_prefill(self, batch: ScheduleBatch):
         if batch.split_index == 0:

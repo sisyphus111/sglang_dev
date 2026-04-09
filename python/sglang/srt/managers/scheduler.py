@@ -20,7 +20,7 @@ import signal
 import sys
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
@@ -226,8 +226,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class DraftStatefulSessionState:
     draft_session_id: str
-    held_req: Optional[Req] = None
-    materialized_token_ids: list[int] = field(default_factory=list)
+    req: Optional[Req] = None
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
@@ -560,6 +559,11 @@ class Scheduler(
         if self.spec_algorithm.is_none():
             self.draft_worker = None
             return
+        if self.spec_algorithm.is_decoupled_draft():
+            # decoupled_draft uses the normal TP worker plus a dedicated scheduler path.
+            # It must not instantiate an additional speculative worker via create_worker().
+            self.draft_worker = None
+            return
 
         # Launch a draft worker for speculative decoding
         draft_worker_kwargs = dict(
@@ -592,7 +596,7 @@ class Scheduler(
         self.maybe_init_draft_worker()
 
         # Dispatch the model worker
-        if self.spec_algorithm.is_none():
+        if self.spec_algorithm.is_none() or self.spec_algorithm.is_decoupled_draft():
             self.model_worker = self.tp_worker
         else:
             self.model_worker = self.draft_worker
@@ -1533,6 +1537,14 @@ class Scheduler(
                 item.feature = None
             req.multimodal_inputs = None
 
+    def _is_draft_stateful_request(
+        self, recv_req: TokenizedGenerateReqInput
+    ) -> bool:
+        return bool(
+            getattr(recv_req, "draft_stateful_mode", False)
+            and getattr(recv_req, "draft_session_id", None)
+        )
+
     def _build_req_from_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -1577,59 +1589,178 @@ class Scheduler(
         req.tokenizer = self.tokenizer
         return req
 
-    def _prepare_stateful_draft_req(
+    def _mark_req_as_draft_stateful(
+        self,
+        req: Req,
+        recv_req: TokenizedGenerateReqInput,
+    ) -> None:
+        req.draft_stateful_mode = True
+        req.draft_session_id = recv_req.draft_session_id
+
+    def _longest_common_prefix_len(
+        self,
+        left: list[int],
+        right: list[int],
+    ) -> int:
+        min_len = min(len(left), len(right))
+        if min_len == 0:
+            return 0
+
+        start = max(0, min_len - 10)
+        for idx in range(start, min_len):
+            if left[idx] != right[idx]:
+                return idx
+
+        return min_len
+
+    def _reset_req_output_state_for_draft_round(self, req: Req) -> None:
+        req.output_ids = []
+        req.finished_reason = None
+        req.finished_len = None
+        req.finished_output = None
+        req.to_finish = None
+        req.decoded_text = ""
+        req.surr_offset = None
+        req.read_offset = None
+        req.send_token_offset = 0
+        req.send_decode_id_offset = 0
+        req.send_output_token_logprobs_offset = 0
+        req.input_logprob_sent = False
+        req.hidden_states = []
+        req.hidden_states_tensor = None
+        req.routed_experts = None
+        req.customized_info = None
+        req.has_log_time_stats = False
+        req._draft_actual_delta = None
+        req._draft_can_use_decode_fast_path = False
+        req._draft_decode_fast_path_input_id = None
+        req._draft_decode_fast_path_base_seq_len = None
+        req.finished_output = None
+        req.is_retracted = False
+        req.is_chunked = 0
+        req.host_hit_length = 0
+        req.last_node = None
+        req.last_host_node = None
+        req.mamba_branching_seqlen = None
+        req.cache_protected_len = 0
+
+        if req.return_logprob:
+            req.output_token_logprobs_val = []
+            req.output_token_logprobs_idx = []
+            req.output_top_logprobs_val = []
+            req.output_top_logprobs_idx = []
+            req.output_token_ids_logprobs_val = []
+            req.output_token_ids_logprobs_idx = []
+
+    def _prepare_draft_stateful_req_for_round(
+        self,
+        req: Req,
+        recv_req: TokenizedGenerateReqInput,
+    ) -> None:
+        previous_full_input_ids = list(req.origin_input_ids) + list(req.output_ids)
+        target_input_ids = list(recv_req.input_ids)
+
+        max_prefix_len = max(len(target_input_ids) - 1, 0)
+        keep_len = min(
+            self._longest_common_prefix_len(previous_full_input_ids, target_input_ids),
+            max_prefix_len,
+        )
+
+        page_size = int(getattr(self.tree_cache, "page_size", 1) or 1)
+        if page_size > 1:
+            keep_len = keep_len // page_size * page_size
+
+        actual_delta = len(target_input_ids) - keep_len
+
+        if req.req_pool_idx is not None and keep_len == 0:
+            raise AssertionError(
+                f"draft request {req.rid} get keep_len 0, freeing all tokens"
+            )
+
+        if req.req_pool_idx is not None and req.kv_allocated_len > keep_len:
+            indices_to_free = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, keep_len : req.kv_allocated_len
+            ]
+            if len(indices_to_free) > 0:
+                self.token_to_kv_pool_allocator.free(indices_to_free)
+
+        self._reset_req_output_state_for_draft_round(req)
+
+        req.origin_input_text = recv_req.input_text
+        req.origin_input_ids = target_input_ids
+        req.origin_input_ids_unpadded = list(target_input_ids)
+        req.sampling_params = recv_req.sampling_params
+        req.return_logprob = recv_req.return_logprob
+        req.top_logprobs_num = recv_req.top_logprobs_num
+        req.token_ids_logprob = recv_req.token_ids_logprob
+        req.stream = recv_req.stream
+        req.priority = recv_req.priority
+        req.return_hidden_states = recv_req.return_hidden_states
+        req.return_routed_experts = recv_req.return_routed_experts
+        req.input_embeds = recv_req.input_embeds
+        req.custom_logit_processor = recv_req.custom_logit_processor
+        req.routing_key = recv_req.routing_key
+        req.http_worker_ipc = recv_req.http_worker_ipc
+        req.extra_key = recv_req.extra_key
+
+        if req.req_pool_idx is not None and keep_len > 0:
+            prefix_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :keep_len
+            ].to(dtype=torch.int64, copy=True)
+        else:
+            prefix_indices = torch.empty((0,), dtype=torch.int64)
+
+        setattr(
+            req,
+            "_draft_manual_prefix_state",
+            {
+                "fill_ids": target_input_ids,
+                "prefix_indices": prefix_indices,
+            },
+        )
+        req._draft_actual_delta = actual_delta
+        can_use_decode_fast_path = (
+            req.req_pool_idx is not None
+            and keep_len > 0
+            and actual_delta == 1
+            and len(target_input_ids) > 0
+        )
+        req._draft_can_use_decode_fast_path = can_use_decode_fast_path
+        if can_use_decode_fast_path:
+            req._draft_decode_fast_path_input_id = target_input_ids[-1]
+            req._draft_decode_fast_path_base_seq_len = keep_len
+        req.kv_committed_len = keep_len
+        req.kv_allocated_len = keep_len
+        req.kv_committed_freed = False
+        req.kv_overallocated_freed = False
+
+    def _can_use_draft_decode_fast_path(self, req: Req) -> bool:
+        return bool(
+            self.spec_algorithm.is_decoupled_draft()
+            and getattr(req, "draft_stateful_mode", False)
+            and getattr(req, "_draft_can_use_decode_fast_path", False)
+        )
+
+    def _get_or_create_draft_stateful_req(
         self,
         recv_req: TokenizedGenerateReqInput,
-        req: Req,
-    ) -> None:
-        if not recv_req.draft_stateful_mode:
-            return
-        if recv_req.draft_session_id is None:
-            raise ValueError("draft_stateful_mode requires draft_session_id")
-
-        session_state = self.draft_stateful_sessions.get(recv_req.draft_session_id)
-        if session_state is None or session_state.held_req is None:
-            return
-
-        held_req = session_state.held_req
-        if held_req.req_pool_idx is None:
-            raise RuntimeError(
-                f"Draft session {recv_req.draft_session_id} lost req_pool_idx"
+    ) -> Req:
+        session_id = recv_req.draft_session_id
+        assert session_id is not None
+        session_state = self.draft_stateful_sessions.get(session_id)
+        if session_state is None or session_state.req is None:
+            req = self._build_req_from_generate_request(recv_req)
+            self._mark_req_as_draft_stateful(req, recv_req)
+            self.draft_stateful_sessions[session_id] = DraftStatefulSessionState(
+                draft_session_id=session_id,
+                req=req,
             )
+            return req
 
-        materialized_ids = session_state.materialized_token_ids
-        incoming_ids = list(recv_req.input_ids)
-        if len(incoming_ids) > len(materialized_ids):
-            raise RuntimeError(
-                "Draft request advanced beyond cached session prefix: "
-                f"{len(incoming_ids)} > {len(materialized_ids)}"
-            )
-        if incoming_ids != materialized_ids[: len(incoming_ids)]:
-            raise RuntimeError(
-                "Draft request tokens no longer match cached session prefix for "
-                f"{recv_req.draft_session_id}"
-            )
-
-        trimmed_len = len(incoming_ids)
-        if trimmed_len < len(materialized_ids):
-            stale_indices = self.req_to_token_pool.req_to_token[
-                held_req.req_pool_idx, trimmed_len : len(materialized_ids)
-            ]
-            self.token_to_kv_pool_allocator.free(stale_indices)
-        held_req.origin_input_ids = incoming_ids
-        held_req.origin_input_ids_unpadded = incoming_ids
-        held_req.output_ids = []
-        held_req.kv_committed_len = trimmed_len
-        held_req.kv_allocated_len = trimmed_len
-
-        req.req_pool_idx = held_req.req_pool_idx
-        req.prefix_indices = self.req_to_token_pool.req_to_token[
-            held_req.req_pool_idx, :trimmed_len
-        ].to(dtype=torch.int64, copy=True)
-        req.cache_protected_len = len(req.prefix_indices)
-        req.kv_committed_len = trimmed_len
-        req.kv_allocated_len = trimmed_len
-        session_state.materialized_token_ids = incoming_ids
+        req = session_state.req
+        self._prepare_draft_stateful_req_for_round(req, recv_req)
+        self._mark_req_as_draft_stateful(req, recv_req)
+        return req
 
     def maybe_preserve_draft_stateful_req(self, req: Req) -> bool:
         if not req.draft_stateful_mode or req.draft_session_id is None:
@@ -1638,32 +1769,31 @@ class Scheduler(
             req.draft_session_id,
             DraftStatefulSessionState(draft_session_id=req.draft_session_id),
         )
-        session_state.held_req = req
-        session_state.materialized_token_ids = list(req.origin_input_ids) + list(
-            req.output_ids
-        )
+        session_state.req = req
         return True
 
     def release_draft_session(self, recv_req: ReleaseDraftSessionReqInput):
         session_state = self.draft_stateful_sessions.pop(recv_req.draft_session_id, None)
-        if session_state is None or session_state.held_req is None:
+        if session_state is None or session_state.req is None:
             return
-        if session_state.held_req.req_pool_idx is None:
-            return
-        release_kv_cache(session_state.held_req, self.tree_cache, is_insert=False)
+        req = session_state.req
+        self.waiting_queue = [queued_req for queued_req in self.waiting_queue if queued_req is not req]
+        if req.req_pool_idx is not None and not req.kv_committed_freed:
+            release_kv_cache(req, self.tree_cache, is_insert=False)
 
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
         # Create a new request
-        if (
+        if self._is_draft_stateful_request(recv_req):
+            req = self._get_or_create_draft_stateful_req(recv_req)
+        elif (
             recv_req.session_params is None
             or recv_req.session_params.id is None
             or recv_req.session_params.id not in self.sessions
         ):
             req = self._build_req_from_generate_request(recv_req)
-            self._prepare_stateful_draft_req(recv_req, req)
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
@@ -2027,7 +2157,18 @@ class Scheduler(
             chunked_req_to_exclude.add(self.chunked_req)
             self.stash_chunked_request(self.chunked_req)
 
-        if self.last_batch and self.last_batch.forward_mode.is_extend():
+        last_batch_needs_running_merge = bool(
+            self.last_batch
+            and (
+                self.last_batch.forward_mode.is_extend()
+                or getattr(
+                    self.last_batch,
+                    "draft_decode_fast_path_pending_merge",
+                    False,
+                )
+            )
+        )
+        if last_batch_needs_running_merge:
             if self.last_batch.chunked_req is not None:
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                 # We need to discard it.
@@ -2047,6 +2188,7 @@ class Scheduler(
             # Merge the new batch into the running batch.
             # For prefill-only batch, we can avoid going through decoding step.
             if not self.last_batch.is_empty() and not self.last_batch.is_prefill_only:
+                self.last_batch.draft_decode_fast_path_pending_merge = False
                 if self.running_batch.is_empty():
                     self.running_batch = self.last_batch
                 else:
@@ -2253,6 +2395,14 @@ class Scheduler(
         if len(can_run_list) == 0:
             return None
 
+        use_draft_decode_fast_path = (
+            self.spec_algorithm.is_decoupled_draft()
+            and self.running_batch.is_empty()
+            and self.chunked_req is None
+            and not self.is_mixed_chunk
+            and all(self._can_use_draft_decode_fast_path(req) for req in can_run_list)
+        )
+
         if self.enable_metrics:
             # only record queue time when enable_metrics is True to avoid overhead
             for req in can_run_list:
@@ -2304,16 +2454,20 @@ class Scheduler(
                 self.tree_cache.ready_to_load_host_cache()
             )
 
-        new_batch.prepare_for_extend()
+        if use_draft_decode_fast_path:
+            new_batch.prepare_for_draft_decode_fast_path()
+            new_batch.prefill_stats = None
+        else:
+            new_batch.prepare_for_extend()
 
-        # Record prefill stats for logging after forward
-        new_batch.prefill_stats = PrefillStats(
-            log_input_tokens=adder.log_input_tokens,
-            log_hit_tokens=adder.log_hit_tokens,
-            new_token_ratio=adder.new_token_ratio,
-            running_bs=len(self.running_batch.reqs),
-            num_new_seqs=len(can_run_list),
-        )
+            # Record prefill stats for logging after forward
+            new_batch.prefill_stats = PrefillStats(
+                log_input_tokens=adder.log_input_tokens,
+                log_hit_tokens=adder.log_hit_tokens,
+                new_token_ratio=adder.new_token_ratio,
+                running_bs=len(self.running_batch.reqs),
+                num_new_seqs=len(can_run_list),
+            )
 
         # Mixed-style chunked prefill
         if (
@@ -2438,7 +2592,11 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
-            if self.spec_algorithm.is_none() or self.enable_overlap:
+            if (
+                self.spec_algorithm.is_none()
+                or self.enable_overlap
+                or self.spec_algorithm.is_decoupled_draft()
+            ):
                 # In most cases, we use the model worker batch to run the forward.
                 worker_batch_or_batch = batch.get_model_worker_batch()
             else:
@@ -2984,7 +3142,10 @@ class Scheduler(
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
-        if self.last_batch and self.last_batch.forward_mode.is_extend():
+        if self.last_batch and (
+            self.last_batch.forward_mode.is_extend()
+            or getattr(self.last_batch, "draft_decode_fast_path_pending_merge", False)
+        ):
             chunked_req_to_exclude = set()
             if recv_req.mode == "in_place":
                 if self.chunked_req is not None:
@@ -2992,6 +3153,7 @@ class Scheduler(
             self.last_batch.filter_batch(
                 chunked_req_to_exclude=list(chunked_req_to_exclude)
             )
+            self.last_batch.draft_decode_fast_path_pending_merge = False
             self.running_batch.merge_batch(self.last_batch)
 
         self.last_batch = None

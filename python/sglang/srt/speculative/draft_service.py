@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from copy import deepcopy
+import time
 
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.speculative.decoupled_spec_io import DraftRequest, DraftResult
@@ -105,6 +106,7 @@ class LocalDrafterService(DrafterServiceApi):
         session: DraftServerSession,
         draft_request: DraftRequest,
     ) -> DraftResult:
+        round_start = time.perf_counter()
         prompt_ids = draft_request.full_token_ids
         request_prompt_length = len(prompt_ids)
         max_possible_tokens = self.max_model_len - request_prompt_length
@@ -136,6 +138,18 @@ class LocalDrafterService(DrafterServiceApi):
             )
 
         draft_token_ids = list(output.get("output_ids", []))
+        round_e2e_ms = (time.perf_counter() - round_start) * 1000.0
+
+        # print(
+        #     "[decoupled-draft] "
+        #     f"rid={draft_request.request_id} "
+        #     f"round={draft_request.draft_round_id} "
+        #     f"prompt_len={request_prompt_length} "
+        #     f"draft_tokens={len(draft_token_ids)} "
+        #     f"draft_round_e2e_ms={round_e2e_ms:.3f} "
+        #     f"finish_reason={finish_reason}",
+        #     flush=True,
+        # )
         return DraftResult(
             request_id=draft_request.request_id,
             draft_round_id=draft_request.draft_round_id,

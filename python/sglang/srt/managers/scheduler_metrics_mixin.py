@@ -43,6 +43,10 @@ LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
 
 
+def _use_spec_metrics(spec_algorithm) -> bool:
+    return not spec_algorithm.is_none() and not spec_algorithm.is_decoupled_draft()
+
+
 @dataclasses.dataclass
 class PrefillStats:
     """Stats for logging prefill batch metrics."""
@@ -365,7 +369,7 @@ class SchedulerMetricsMixin:
         iter_msg = f" [{self.forward_ct}]" if LOG_FORWARD_ITERS else ""
         msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
 
-        if self.spec_algorithm.is_none():
+        if not _use_spec_metrics(self.spec_algorithm):
             spec_accept_length = 0
             spec_accept_rate = 0
         else:
@@ -677,7 +681,7 @@ class SchedulerMetricsMixin:
 
         speculative = None
         if include_all or "spec" in include:
-            if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
+            if _use_spec_metrics(self.spec_algorithm) and self.spec_total_num_forward_ct > 0:
                 speculative = SpeculativeMetrics(
                     accept_length=(
                         self.spec_total_num_accepted_tokens

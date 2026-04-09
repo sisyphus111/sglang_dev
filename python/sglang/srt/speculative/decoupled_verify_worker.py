@@ -86,6 +86,12 @@ def _normalize_token_id(value) -> int | None:
         return None
 
 
+def _is_cuda_device(device: str | torch.device) -> bool:
+    if isinstance(device, torch.device):
+        return device.type == "cuda"
+    return str(device).startswith("cuda")
+
+
 def _build_linear_topk1_tree_metadata(
     batch_size: int,
     spec_steps: int,
@@ -260,6 +266,7 @@ class VerifyDraftSessionState:
 @dataclass
 class VerifyCoordinatorState:
     sessions: dict[str, VerifyDraftSessionState] = field(default_factory=dict)
+    submit_times_by_key: dict[DraftLookupKey, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -329,6 +336,15 @@ class VerifyCoordinator:
 
     def clear_request(self, request_id: str) -> None:
         self.state.sessions.pop(request_id, None)
+        for key in list(self.state.submit_times_by_key):
+            if key.request_id == request_id:
+                self.state.submit_times_by_key.pop(key, None)
+
+    def record_submit_time(self, waiting_key: DraftLookupKey, submit_ts: float) -> None:
+        self.state.submit_times_by_key[waiting_key] = float(submit_ts)
+
+    def pop_submit_time(self, waiting_key: DraftLookupKey) -> float | None:
+        return self.state.submit_times_by_key.pop(waiting_key, None)
 
     def build_draft_request(self, req, draft_round_id: int) -> DraftRequest:
         return DraftRequest(
@@ -346,8 +362,10 @@ class VerifyCoordinator:
         req,
         draft_request: DraftRequest,
         needs_warmup_decode: bool,
+        submit_ts: float,
     ) -> None:
         self.append_waiting_key(req.rid, draft_request.key)
+        self.record_submit_time(draft_request.key, submit_ts)
         if needs_warmup_decode:
             self.mark_warmup_decode(req.rid)
         setattr(req, "needs_warmup_decode", needs_warmup_decode)
@@ -360,6 +378,7 @@ class VerifyCoordinator:
         warmup_request_ids: set[str] | None = None,
     ) -> list[DraftRequest]:
         draft_requests: list[DraftRequest] = []
+        submit_ts = time.perf_counter()
         for req in reqs:
             draft_round_id = self.alloc_next_round_id(req.rid)
             draft_request = self.build_draft_request(req, draft_round_id)
@@ -370,6 +389,7 @@ class VerifyCoordinator:
                 req,
                 draft_request,
                 needs_warmup_decode=needs_warmup_decode,
+                submit_ts=submit_ts,
             )
             draft_requests.append(draft_request)
         return draft_requests
@@ -389,7 +409,8 @@ class VerifyCoordinator:
         self,
         live_reqs,
         results: list[DraftResult],
-    ) -> None:
+    ) -> list[tuple[DraftResult, float | None]]:
+        bind_records: list[tuple[DraftResult, float | None]] = []
         results_by_key = {result.key: result for result in results}
         for req in live_reqs:
             waiting_key = self.peek_waiting_key(req.rid)
@@ -418,9 +439,14 @@ class VerifyCoordinator:
                     "Draft result round mismatch: "
                     f"{draft_result.draft_round_id} != expected {expected_round_id}"
                 )
+            submit_ts = self.pop_submit_time(waiting_key)
             self.pop_waiting_key(req.rid)
             setattr(req, "draft_result", draft_result)
-
+            submit_to_result_ms = None
+            if submit_ts is not None:
+                submit_to_result_ms = (time.perf_counter() - submit_ts) * 1000
+            bind_records.append((draft_result, submit_to_result_ms))
+        return bind_records
     def build_post_batch_actions(self, batch_reqs) -> VerifyBatchActions:
         actions = VerifyBatchActions()
         requests_to_submit = []
@@ -488,6 +514,8 @@ class VerifyWorker:
         self.total_accepted_draft_tokens = 0
         self.total_verified_tokens = 0
         self.total_verified_reqs = 0
+        self.total_round_forward_time_ms = 0.0
+        self.total_round_forward_ct = 0
         self._last_logged_avg_req_len_bucket = 0
         self.coordinator = VerifyCoordinator(
             scheduler_dp_rank=self.dp_rank,
@@ -572,15 +600,37 @@ class VerifyWorker:
         missing_keys = self.coordinator.collect_missing_poll_keys(target_reqs)
         polled_results = None
         if self._is_entry_rank() and missing_keys:
+            poll_wait_start = time.perf_counter()
             self._send_backend_message(
                 DraftBackendMessage.from_poll_request(
                     PollDraftResultsRequest(keys=missing_keys)
                 )
             )
             polled_results = self._recv_poll_response()
+            poll_wait_ms = (time.perf_counter() - poll_wait_start) * 1000
+            # print(
+            #     "[decoupled-verify] "
+            #     f"poll_wait_ms={poll_wait_ms:.3f} "
+            #     f"missing_keys={len(missing_keys)} "
+            #     f"ready_results={len(polled_results)}",
+            #     flush=True,
+            # )
 
         synced_results = self._sync_polled_results(scheduler, polled_results)
-        self.coordinator.bind_polled_results_to_live_reqs(target_reqs, synced_results)
+        bind_records = self.coordinator.bind_polled_results_to_live_reqs(
+            target_reqs, synced_results
+        )
+        if self._is_entry_rank():
+            for draft_result, submit_to_result_ms in bind_records:
+                if submit_to_result_ms is None:
+                    continue
+                # print(
+                #     "[decoupled-verify] "
+                #     f"submit_draft_to_result_ms={submit_to_result_ms:.3f} "
+                #     f"rid={draft_result.request_id} "
+                #     f"round={draft_result.draft_round_id}",
+                #     flush=True,
+                # )
 
     def _submit_draft_requests(self, requests: list[DraftRequest]) -> None:
         if requests and self._is_entry_rank():
@@ -685,6 +735,19 @@ class VerifyWorker:
                 pad_token_id,
             )
 
+        # if self._is_entry_rank():
+        #     print(
+        #         "[decoupled-diagnose] verify anchor mismatch "
+        #         f"rid={req.rid} round={draft_result.draft_round_id} "
+        #         f"tail_token={tail_token} "
+        #         f"draft_anchor_token={draft_result.draft_token_ids[0]} "
+        #         f"prompt_len={len(req.origin_input_ids)} "
+        #         f"committed_len={len(req.output_ids)} "
+        #         f"draft_token_count={len(draft_result.draft_token_ids)} "
+        #         "draft_tokens_head="
+        #         f"{draft_result.draft_token_ids[: min(4, len(draft_result.draft_token_ids))]}",
+        #         flush=True,
+        #     )
         return [tail_token] + [pad_token_id] * (verify_window_len - 1)
 
     def _build_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
@@ -758,9 +821,20 @@ class VerifyWorker:
         )
 
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
+        forward_start = time.perf_counter()
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             model_worker_batch = batch.get_model_worker_batch()
-            return self.target_worker.forward_batch_generation(model_worker_batch)
+            result = self.target_worker.forward_batch_generation(model_worker_batch)
+            if _is_cuda_device(batch.device):
+                torch.cuda.synchronize()
+            extend_forward_time_ms = (time.perf_counter() - forward_start) * 1000
+            # if self._is_entry_rank():
+            #     print(
+            #         "[decoupled-verify] "
+            #         f"extend_forward_time_ms={extend_forward_time_ms:.3f}",
+            #         flush=True,
+            #     )
+            return result
 
         spec_info = self._build_verify_input(batch)
         can_use_full_graph_path = (
@@ -768,9 +842,10 @@ class VerifyWorker:
         )
         verify_start = time.perf_counter()
         logits_output, verify_output, _, can_run_cuda_graph = self.verify(batch, spec_info)
-        if batch.device.type == "cuda":
+        if _is_cuda_device(batch.device):
             torch.cuda.synchronize()
         verify_duration_ms = (time.perf_counter() - verify_start) * 1000
+        round_forward_time_ms = (time.perf_counter() - forward_start) * 1000
         batch_size = batch.batch_size()
         avg_req_len = (
             float(batch.seq_lens.float().mean().item()) if batch_size > 0 else 0.0
@@ -778,12 +853,14 @@ class VerifyWorker:
         avg_req_len_bucket = int(avg_req_len // 500)
         if avg_req_len_bucket > self._last_logged_avg_req_len_bucket:
             self._last_logged_avg_req_len_bucket = avg_req_len_bucket
-            logger.info(
-                "[decoupled-verify] bs=%s verify_ms=%.3f avg_req_len=%.3f",
-                batch_size,
-                verify_duration_ms,
-                avg_req_len,
-            )
+            # if self._is_entry_rank():
+            #     print(
+            #         "[decoupled-verify] "
+            #         f"bs={batch_size} "
+            #         f"verify_ms={verify_duration_ms:.3f} "
+            #         f"avg_req_len={avg_req_len:.3f}",
+            #         flush=True,
+            #     )
 
         normalize_external_draft_batch_spec_info(batch)
         result = GenerationBatchResult(
@@ -800,6 +877,38 @@ class VerifyWorker:
         self.total_accepted_draft_tokens += accepted_draft_tokens
         self.total_verified_tokens += verified_tokens
         self.total_verified_reqs += verified_reqs
+        avg_tokens_per_round = (
+            self.total_verified_tokens / self.total_verified_reqs
+            if self.total_verified_reqs > 0
+            else 0.0
+        )
+        self.total_round_forward_time_ms += round_forward_time_ms
+        self.total_round_forward_ct += 1
+        avg_round_forward_time_ms = (
+            self.total_round_forward_time_ms / self.total_round_forward_ct
+            if self.total_round_forward_ct > 0
+            else 0.0
+        )
+        target_disable_cuda_graph = bool(
+            getattr(self.target_worker.model_runner.server_args, "disable_cuda_graph", False)
+        )
+        target_has_graph_runner = (
+            getattr(self.target_worker.model_runner, "graph_runner", None) is not None
+        )
+        target_graph_can_run = bool(can_run_cuda_graph)
+        # if self._is_entry_rank():
+        #     print(
+        #         "[decoupled-verify] "
+        #         f"accepted_this_round={accepted_draft_tokens} "
+        #         f"avg_tokens_per_round={avg_tokens_per_round:.3f} "
+        #         f"target_disable_cuda_graph={target_disable_cuda_graph} "
+        #         f"target_has_graph_runner={target_has_graph_runner} "
+        #         f"target_graph_can_run={target_graph_can_run} "
+        #         f"verify_can_run_cuda_graph={bool(can_run_cuda_graph)} "
+        #         f"verify_use_full_graph_path={bool(can_use_full_graph_path)} "
+        #         f"avg_round_forward_time_ms={avg_round_forward_time_ms:.3f}",
+        #         flush=True,
+        #     )
         return result
 
 

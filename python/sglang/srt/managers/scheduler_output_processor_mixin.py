@@ -38,6 +38,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_FORCE_STREAM_INTERVAL = 50
 
 
+def _treat_as_normal_decode(spec_algorithm) -> bool:
+    return spec_algorithm.is_none() or spec_algorithm.is_decoupled_draft()
+
+
 class SchedulerOutputProcessorMixin:
     """
     This class implements the output processing logic for Scheduler.
@@ -432,7 +436,7 @@ class SchedulerOutputProcessorMixin:
             result.can_run_cuda_graph,
         )
 
-        if batch.spec_algorithm.is_none():
+        if _treat_as_normal_decode(batch.spec_algorithm):
             next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
@@ -440,7 +444,7 @@ class SchedulerOutputProcessorMixin:
             next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
 
         self.num_generated_tokens += len(batch.reqs)
-        if not batch.spec_algorithm.is_none():
+        if not _treat_as_normal_decode(batch.spec_algorithm):
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
         if self.enable_metrics:
             self.metrics_collector.increment_cuda_graph_pass(value=can_run_cuda_graph)
@@ -461,7 +465,7 @@ class SchedulerOutputProcessorMixin:
                 continue
 
             new_accepted_len = 1
-            if batch.spec_algorithm.is_none():
+            if _treat_as_normal_decode(batch.spec_algorithm):
                 req.output_ids.append(next_token_id)
             elif batch.is_spec_v2:
                 # Only spec v2's output_ids are updated here.
@@ -489,7 +493,7 @@ class SchedulerOutputProcessorMixin:
 
             self.maybe_collect_customized_info(i, req, logits_output)
 
-            if req.return_logprob and batch.spec_algorithm.is_none():
+            if req.return_logprob and _treat_as_normal_decode(batch.spec_algorithm):
                 # speculative worker handles logprob in speculative decoding
                 req.output_token_logprobs_val.append(next_token_logprobs[i])
                 req.output_token_logprobs_idx.append(next_token_id)
@@ -516,7 +520,7 @@ class SchedulerOutputProcessorMixin:
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:
-                    if batch.spec_algorithm.is_none():
+                    if _treat_as_normal_decode(batch.spec_algorithm):
                         # Normal decode: single token
                         req.grammar.accept_token(next_token_id)
                     elif batch.is_spec_v2:
@@ -549,12 +553,15 @@ class SchedulerOutputProcessorMixin:
         seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
         if req.mamba_ping_pong_track_buffer is not None:
             mamba_track_interval = get_global_server_args().mamba_track_interval
-            if batch.spec_algorithm.is_none() and seq_len % mamba_track_interval == 0:
+            if (
+                _treat_as_normal_decode(batch.spec_algorithm)
+                and seq_len % mamba_track_interval == 0
+            ):
                 # for non-spec decode, we update mamba_last_track_seqlen at the end of each track interval
                 req.mamba_next_track_idx = 1 - req.mamba_next_track_idx
                 req.mamba_last_track_seqlen = seq_len
             elif (
-                not batch.spec_algorithm.is_none()
+                not _treat_as_normal_decode(batch.spec_algorithm)
                 and result.accept_length_per_req_cpu is not None
             ):
                 # for spec decode, update mamba_last_track_seqlen if this iteration crosses a track interval
@@ -1044,7 +1051,7 @@ class SchedulerOutputProcessorMixin:
                     req.time_stats.get_prefill_finished_ts()
                 )
 
-                if not self.spec_algorithm.is_none():
+                if not _treat_as_normal_decode(self.spec_algorithm):
                     spec_verify_ct.append(req.spec_verify_ct)
                     spec_accepted_tokens.append(req.spec_accepted_tokens)
                     spec_acceptance_histogram.append(req.spec_acceptance_histogram)

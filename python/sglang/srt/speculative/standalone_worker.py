@@ -1,4 +1,5 @@
 import logging
+import time
 from typing import Optional
 
 import torch
@@ -7,7 +8,9 @@ from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
 )
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_worker import EAGLEWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -44,10 +47,17 @@ class StandaloneWorker(EAGLEWorker):
         self.gpu_id = gpu_id
         self.device = server_args.device
         self.target_worker = target_worker
+        self.tp_rank = int(tp_rank)
+        self.attn_cp_rank = int(attn_cp_rank)
+        self.pp_rank = 0
         self.page_size = server_args.page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self.total_verified_tokens = 0
+        self.total_verified_reqs = 0
+        self.total_round_forward_time_ms = 0.0
+        self.total_round_forward_ct = 0
 
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -107,3 +117,93 @@ class StandaloneWorker(EAGLEWorker):
             (), dtype=torch.int64, device=self.device
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
+
+    def _is_entry_rank(self) -> bool:
+        return self.pp_rank == 0 and self.tp_rank == 0 and self.attn_cp_rank == 0
+
+    def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
+        forward_start = time.perf_counter()
+        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            logits_output, next_token_ids, seq_lens_cpu = self.forward_target_extend(batch)
+            with self.draft_tp_context(
+                self.draft_model_runner.tp_group
+            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+                self.forward_draft_extend(
+                    batch,
+                    logits_output.hidden_states,
+                    next_token_ids,
+                    seq_lens_cpu,
+                    logits_output.mm_input_embeds,
+                )
+            if str(batch.device).startswith("cuda"):
+                torch.cuda.synchronize()
+            extend_forward_time_ms = (time.perf_counter() - forward_start) * 1000
+            # if self._is_entry_rank():
+                # print(
+                #     "[coupled-spec] "
+                #     f"extend_forward_time_ms={extend_forward_time_ms:.3f}",
+                #     flush=True,
+                # )
+            return GenerationBatchResult(
+                logits_output=logits_output,
+                next_token_ids=next_token_ids,
+                num_accepted_tokens=0,
+                can_run_cuda_graph=False,
+            )
+
+        with self.draft_tp_context(
+            self.draft_model_runner.tp_group
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            spec_info = self.draft(batch)
+        logits_output, verify_output, model_worker_batch, can_run_cuda_graph = self.verify(
+            batch, spec_info
+        )
+
+        with self.draft_tp_context(
+            self.draft_model_runner.tp_group
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            if (
+                self.server_args.enable_dp_attention
+                or batch.spec_info.verified_id.shape[0] > 0
+            ):
+                self.forward_draft_extend_after_decode(batch)
+
+        if str(batch.device).startswith("cuda"):
+            torch.cuda.synchronize()
+        round_forward_time_ms = (time.perf_counter() - forward_start) * 1000
+
+        result = GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=verify_output.verified_id,
+            num_accepted_tokens=sum(verify_output.accept_length_per_req_cpu),
+            accept_length_per_req_cpu=verify_output.accept_length_per_req_cpu,
+            can_run_cuda_graph=can_run_cuda_graph,
+        )
+        del model_worker_batch
+
+        verified_reqs = len(verify_output.accept_length_per_req_cpu)
+        verified_tokens = int(result.num_accepted_tokens) + verified_reqs
+        self.total_verified_tokens += verified_tokens
+        self.total_verified_reqs += verified_reqs
+        self.total_round_forward_time_ms += round_forward_time_ms
+        self.total_round_forward_ct += 1
+        avg_tokens_per_round = (
+            self.total_verified_tokens / self.total_verified_reqs
+            if self.total_verified_reqs > 0
+            else 0.0
+        )
+        avg_round_forward_time_ms = (
+            self.total_round_forward_time_ms / self.total_round_forward_ct
+            if self.total_round_forward_ct > 0
+            else 0.0
+        )
+        # if self._is_entry_rank():
+        #     print(
+        #         "[coupled-spec] "
+        #         f"round_forward_time_ms={round_forward_time_ms:.3f} "
+        #         f"accepted_this_round={int(result.num_accepted_tokens)} "
+        #         f"avg_tokens_per_round={avg_tokens_per_round:.3f} "
+        #         f"avg_round_forward_time_ms={avg_round_forward_time_ms:.3f}",
+        #         flush=True,
+        #     )
+        return result

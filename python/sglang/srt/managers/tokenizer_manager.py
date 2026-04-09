@@ -1484,6 +1484,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             BatchTokenIDOutput,
         ],
     ):
+        spec_algorithm = SpeculativeAlgorithm.from_string(
+            self.server_args.speculative_algorithm
+        )
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
@@ -1596,7 +1599,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 state.finished_time_perf = time.perf_counter()
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
 
-                if self.server_args.speculative_algorithm:
+                if (
+                    self.server_args.speculative_algorithm
+                    and not spec_algorithm.is_decoupled_draft()
+                ):
                     self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
                 if self.enable_metrics:
                     self._calculate_timing_metrics(meta_info, state, recv_obj, i)
@@ -1838,6 +1844,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         """Calculate speculative decoding metrics, such as acceptance rate and acceptance length metrics."""
         if (
             hasattr(recv_obj, "spec_verify_ct")
+            and len(recv_obj.spec_verify_ct) > i
             and recv_obj.spec_verify_ct[i] > 0
             and hasattr(recv_obj, "spec_accepted_tokens")
             and len(recv_obj.spec_accepted_tokens) > i

@@ -145,13 +145,13 @@ class DraftBackendClient:
                 context,
                 zmq.PUSH,
                 endpoints.scheduler_to_backend_ipc_name,
-                True,
+                False,
             ),
             recv_socket=get_zmq_socket(
                 context,
                 zmq.PULL,
                 endpoints.backend_to_scheduler_ipc_name,
-                True,
+                False,
             ),
         )
 

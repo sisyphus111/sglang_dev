@@ -565,6 +565,10 @@ class Req(ReqDllmMixin):
         self.draft_session_id = draft_session_id
         self.draft_stateful_mode = draft_stateful_mode
         self.input_embeds = input_embeds
+        self._draft_actual_delta = None
+        self._draft_can_use_decode_fast_path = False
+        self._draft_decode_fast_path_input_id = None
+        self._draft_decode_fast_path_base_seq_len = None
 
         # For req-level memory management
         self.kv_committed_len = 0
@@ -890,6 +894,26 @@ class Req(ReqDllmMixin):
         return self.finished_reason is not None
 
     def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
+        manual_prefix_state = getattr(self, "_draft_manual_prefix_state", None)
+        if manual_prefix_state is not None:
+            assert (
+                tree_cache is not None
+            ), "draft manual prefix state requires a valid tree_cache"
+            self.fill_ids = list(manual_prefix_state["fill_ids"])
+            self.prefix_indices = manual_prefix_state["prefix_indices"]
+            root_node = getattr(tree_cache, "root_node", None)
+            self.last_node = root_node
+            self.last_host_node = root_node
+            self.host_hit_length = 0
+            self.mamba_branching_seqlen = None
+            if self.draft_stateful_mode:
+                self.cache_protected_len = 0
+            else:
+                self.cache_protected_len = len(self.prefix_indices)
+            self.set_extend_input_len(len(self.fill_ids) - len(self.prefix_indices))
+            delattr(self, "_draft_manual_prefix_state")
+            return
+
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
             self.determine_dllm_phase()
@@ -903,13 +927,6 @@ class Req(ReqDllmMixin):
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
         max_prefix_len = max(max_prefix_len, 0)
         token_ids = self.fill_ids[:max_prefix_len]
-
-        # Decoupled drafter owns its session KV continuation explicitly and does not rely
-        # on tree-cache prefix matching, even for the first round.
-        if self.draft_stateful_mode:
-            self.cache_protected_len = len(self.prefix_indices)
-            self.set_extend_input_len(len(self.fill_ids) - len(self.prefix_indices))
-            return
 
         if tree_cache is not None:
             match_result = tree_cache.match_prefix(
@@ -1228,6 +1245,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # the check of whether to prefill new requests.
     # This is an optimization to reduce the overhead of the prefill check.
     batch_is_full: bool = False
+    draft_decode_fast_path_pending_merge: bool = False
 
     # For chunked prefill in PP
     chunked_req: Optional[Req] = None
@@ -1819,7 +1837,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             else [self.reqs[i] for i in selected_indices]
         )
 
-        if self.spec_algorithm.is_none():
+        if self.spec_algorithm.is_none() or self.spec_algorithm.is_decoupled_draft():
             new_pages = sum(1 for r in requests if r.kv_committed_len % page_size == 0)
             return new_pages * page_size
 
@@ -1859,6 +1877,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self, server_args: ServerArgs
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
+        if any(getattr(req, "draft_stateful_mode", False) for req in self.reqs):
+            raise AssertionError(
+                "drafter stateful no-radix mode does not support retract_decode; "
+                "please lower concurrency or memory usage"
+            )
         sorted_indices = list(range(len(self.reqs)))
 
         # TODO(lsyin): improve retraction policy for radix cache
@@ -1965,7 +1988,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             draft_input: EagleDraftInput = self.spec_info
             draft_input.prepare_for_decode(self)
 
-        if not self.spec_algorithm.is_none():
+        if not (
+            self.spec_algorithm.is_none()
+            or self.spec_algorithm.is_decoupled_draft()
+        ):
             # if spec decoding is used, the decode batch is prepared inside
             # `forward_batch_speculative_generation` after running draft models.
             return
@@ -2039,6 +2065,58 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 dtype=torch.bool,
                 device=self.device,
             )
+
+    def prepare_for_draft_decode_fast_path(self):
+        self.forward_mode = ForwardMode.DECODE
+        self.draft_decode_fast_path_pending_merge = True
+
+        decode_input_ids = []
+        base_seq_lens = []
+        req_pool_indices = []
+
+        for req in self.reqs:
+            input_token_id = getattr(req, "_draft_decode_fast_path_input_id", None)
+            base_seq_len = getattr(req, "_draft_decode_fast_path_base_seq_len", None)
+            if (
+                not getattr(req, "_draft_can_use_decode_fast_path", False)
+                or input_token_id is None
+                or base_seq_len is None
+                or req.req_pool_idx is None
+            ):
+                raise ValueError(
+                    "Draft decode fast path requires a preserved stateful req "
+                    f"with req_pool_idx and external committed token, got {req.rid=}"
+                )
+
+            decode_input_ids.append(int(input_token_id))
+            base_seq_lens.append(int(base_seq_len))
+            req_pool_indices.append(int(req.req_pool_idx))
+
+        self.output_ids = torch.tensor(
+            decode_input_ids, dtype=torch.int64, device=self.device
+        )
+        self.req_pool_indices = torch.tensor(
+            req_pool_indices, dtype=torch.int32, device=self.device
+        )
+        self.seq_lens = torch.tensor(
+            base_seq_lens, dtype=torch.int64, device=self.device
+        )
+        self.seq_lens_cpu = torch.tensor(base_seq_lens, dtype=torch.int64)
+        self.orig_seq_lens = torch.tensor(
+            base_seq_lens, dtype=torch.int32, device=self.device
+        )
+        self.seq_lens_sum = sum(base_seq_lens)
+        self.extend_num_tokens = 0
+        self.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            self,
+            self.model_config.vocab_size,
+        )
+        self.prepare_for_decode()
+
+        for req in self.reqs:
+            req._draft_can_use_decode_fast_path = False
+            req._draft_decode_fast_path_input_id = None
+            req._draft_decode_fast_path_base_seq_len = None
 
     def maybe_wait_verify_done(self):
         if self.is_spec_v2:
@@ -2274,6 +2352,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_seqlens=self.mamba_track_seqlens,
             dp_cooperation_info=self.dp_cooperation_info,
             prefill_stats=self.prefill_stats,
+            draft_decode_fast_path_pending_merge=self.draft_decode_fast_path_pending_merge,
         )
 
     def maybe_evict_swa(self):

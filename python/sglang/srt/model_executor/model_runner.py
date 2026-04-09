@@ -1847,11 +1847,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if major < 9:
             return False
 
-        if (
-            self.spec_algorithm.is_eagle()
-            or self.spec_algorithm.is_standalone()
-            or self.spec_algorithm.is_ngram()
-        ):
+        if self.spec_algorithm.uses_target_verify_graph_capture():
             return not self.is_draft_worker
 
         return True
@@ -1881,11 +1877,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             capture_forward_mode = ForwardMode.EXTEND
         capture_hidden_mode = CaptureHiddenMode.NULL
         num_tokens_per_bs = 1
-        if (
-            self.spec_algorithm.is_eagle()
-            or self.spec_algorithm.is_standalone()
-            or self.spec_algorithm.is_ngram()
-        ):
+        if self.spec_algorithm.uses_target_verify_graph_capture():
             if self.is_draft_worker:
                 raise RuntimeError("This should not happen")
             else:
@@ -1992,7 +1984,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         def get_spec_info():
             spec_info = None
-            if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
+            if self.spec_algorithm.uses_target_verify_graph_capture():
                 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
                 if self.is_draft_worker:
