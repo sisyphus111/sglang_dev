@@ -215,6 +215,10 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     modalities: Optional[List[str]] = None
     # Session info for continual prompting
     session_params: Optional[Union[List[Dict], Dict]] = None
+    # Drafter-only stateful KV session identifier.
+    draft_session_id: Optional[str] = None
+    # Whether the request should reuse drafter session KV state.
+    draft_stateful_mode: bool = False
 
     # The path to the LoRA adaptors
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
@@ -680,6 +684,8 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             extra_key=self.extra_key,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
+            draft_session_id=self.draft_session_id,
+            draft_stateful_mode=self.draft_stateful_mode,
             return_bytes=self.return_bytes,
             return_entropy=self.return_entropy,
             external_trace_header=self.external_trace_header,
@@ -725,6 +731,10 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Session info for continual prompting
     session_params: Optional[SessionParams] = None
+    # Drafter-only stateful KV session identifier.
+    draft_session_id: Optional[str] = None
+    # Whether the request should reuse drafter session KV state.
+    draft_stateful_mode: bool = False
 
     # LoRA related
     lora_id: Optional[str] = None  # None means just use the base model
@@ -1639,6 +1649,11 @@ class OpenSessionReqInput(BaseReq):
 @dataclass
 class CloseSessionReqInput(BaseReq):
     session_id: str
+
+
+@dataclass
+class ReleaseDraftSessionReqInput(BaseReq):
+    draft_session_id: str
 
 
 @dataclass

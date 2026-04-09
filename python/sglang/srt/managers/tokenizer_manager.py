@@ -936,6 +936,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 lora_id=obj.lora_id,
                 input_embeds=input_embeds,
                 session_params=session_params,
+                draft_session_id=obj.draft_session_id,
+                draft_stateful_mode=obj.draft_stateful_mode,
                 custom_logit_processor=obj.custom_logit_processor,
                 require_reasoning=obj.require_reasoning,
                 return_hidden_states=obj.return_hidden_states,

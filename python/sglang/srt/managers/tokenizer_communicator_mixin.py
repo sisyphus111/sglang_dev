@@ -62,6 +62,7 @@ from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
+    ReleaseDraftSessionReqInput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -927,6 +928,11 @@ class TokenizerCommunicatorMixin:
         self, obj: CloseSessionReqInput, request: Optional[fastapi.Request] = None
     ):
         await self.send_to_scheduler.send_pyobj(obj)
+
+    async def release_draft_session(self, draft_session_id: str) -> None:
+        self.send_to_scheduler.send_pyobj(
+            ReleaseDraftSessionReqInput(draft_session_id=draft_session_id)
+        )
 
     def _update_weight_version_if_provided(self, weight_version: Optional[str]) -> None:
         """Update weight version if provided."""

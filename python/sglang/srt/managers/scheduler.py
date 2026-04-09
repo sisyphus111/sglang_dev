@@ -20,7 +20,7 @@ import signal
 import sys
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
@@ -115,6 +115,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqOutput,
     PauseGenerationReqInput,
     ProfileReq,
+    ReleaseDraftSessionReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
@@ -220,6 +221,13 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class DraftStatefulSessionState:
+    draft_session_id: str
+    held_req: Optional[Req] = None
+    materialized_token_ids: list[int] = field(default_factory=list)
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
@@ -775,6 +783,7 @@ class Scheduler(
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
         self.sessions: Dict[str, Session] = {}
+        self.draft_stateful_sessions: Dict[str, DraftStatefulSessionState] = {}
         self.forward_sleep_time = None
         self._engine_paused = False
 
@@ -1091,6 +1100,7 @@ class Scheduler(
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
+                (ReleaseDraftSessionReqInput, self.release_draft_session),
                 (UpdateWeightFromDiskReqInput, self.update_weights_from_disk),
                 (InitWeightsUpdateGroupReqInput, self.init_weights_update_group),
                 (DestroyWeightsUpdateGroupReqInput, self.destroy_weights_update_group),
@@ -1523,6 +1533,125 @@ class Scheduler(
                 item.feature = None
             req.multimodal_inputs = None
 
+    def _build_req_from_generate_request(
+        self,
+        recv_req: TokenizedGenerateReqInput,
+    ) -> Req:
+        if recv_req.input_embeds is not None:
+            seq_length = len(recv_req.input_embeds)
+            recv_req.input_ids = [1] * seq_length
+
+        if recv_req.bootstrap_port is None:
+            recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
+
+        req = Req(
+            recv_req.rid,
+            recv_req.input_text,
+            recv_req.input_ids,
+            recv_req.sampling_params,
+            return_logprob=recv_req.return_logprob,
+            top_logprobs_num=recv_req.top_logprobs_num,
+            token_ids_logprob=recv_req.token_ids_logprob,
+            stream=recv_req.stream,
+            lora_id=recv_req.lora_id,
+            input_embeds=recv_req.input_embeds,
+            custom_logit_processor=recv_req.custom_logit_processor,
+            require_reasoning=recv_req.require_reasoning,
+            return_hidden_states=recv_req.return_hidden_states,
+            return_routed_experts=recv_req.return_routed_experts,
+            eos_token_ids=self.model_config.hf_eos_token_id,
+            bootstrap_host=recv_req.bootstrap_host,
+            bootstrap_port=recv_req.bootstrap_port,
+            bootstrap_room=recv_req.bootstrap_room,
+            disagg_mode=self.disaggregation_mode,
+            data_parallel_rank=recv_req.data_parallel_rank,
+            vocab_size=self.model_config.vocab_size,
+            priority=recv_req.priority,
+            metrics_collector=(self.metrics_collector if self.enable_metrics else None),
+            routing_key=recv_req.routing_key,
+            http_worker_ipc=recv_req.http_worker_ipc,
+            dllm_config=self.dllm_config,
+            draft_session_id=recv_req.draft_session_id,
+            draft_stateful_mode=recv_req.draft_stateful_mode,
+        )
+        req.tokenizer = self.tokenizer
+        return req
+
+    def _prepare_stateful_draft_req(
+        self,
+        recv_req: TokenizedGenerateReqInput,
+        req: Req,
+    ) -> None:
+        if not recv_req.draft_stateful_mode:
+            return
+        if recv_req.draft_session_id is None:
+            raise ValueError("draft_stateful_mode requires draft_session_id")
+
+        session_state = self.draft_stateful_sessions.get(recv_req.draft_session_id)
+        if session_state is None or session_state.held_req is None:
+            return
+
+        held_req = session_state.held_req
+        if held_req.req_pool_idx is None:
+            raise RuntimeError(
+                f"Draft session {recv_req.draft_session_id} lost req_pool_idx"
+            )
+
+        materialized_ids = session_state.materialized_token_ids
+        incoming_ids = list(recv_req.input_ids)
+        if len(incoming_ids) > len(materialized_ids):
+            raise RuntimeError(
+                "Draft request advanced beyond cached session prefix: "
+                f"{len(incoming_ids)} > {len(materialized_ids)}"
+            )
+        if incoming_ids != materialized_ids[: len(incoming_ids)]:
+            raise RuntimeError(
+                "Draft request tokens no longer match cached session prefix for "
+                f"{recv_req.draft_session_id}"
+            )
+
+        trimmed_len = len(incoming_ids)
+        if trimmed_len < len(materialized_ids):
+            stale_indices = self.req_to_token_pool.req_to_token[
+                held_req.req_pool_idx, trimmed_len : len(materialized_ids)
+            ]
+            self.token_to_kv_pool_allocator.free(stale_indices)
+        held_req.origin_input_ids = incoming_ids
+        held_req.origin_input_ids_unpadded = incoming_ids
+        held_req.output_ids = []
+        held_req.kv_committed_len = trimmed_len
+        held_req.kv_allocated_len = trimmed_len
+
+        req.req_pool_idx = held_req.req_pool_idx
+        req.prefix_indices = self.req_to_token_pool.req_to_token[
+            held_req.req_pool_idx, :trimmed_len
+        ].to(dtype=torch.int64, copy=True)
+        req.cache_protected_len = len(req.prefix_indices)
+        req.kv_committed_len = trimmed_len
+        req.kv_allocated_len = trimmed_len
+        session_state.materialized_token_ids = incoming_ids
+
+    def maybe_preserve_draft_stateful_req(self, req: Req) -> bool:
+        if not req.draft_stateful_mode or req.draft_session_id is None:
+            return False
+        session_state = self.draft_stateful_sessions.setdefault(
+            req.draft_session_id,
+            DraftStatefulSessionState(draft_session_id=req.draft_session_id),
+        )
+        session_state.held_req = req
+        session_state.materialized_token_ids = list(req.origin_input_ids) + list(
+            req.output_ids
+        )
+        return True
+
+    def release_draft_session(self, recv_req: ReleaseDraftSessionReqInput):
+        session_state = self.draft_stateful_sessions.pop(recv_req.draft_session_id, None)
+        if session_state is None or session_state.held_req is None:
+            return
+        if session_state.held_req.req_pool_idx is None:
+            return
+        release_kv_cache(session_state.held_req, self.tree_cache, is_insert=False)
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -1533,47 +1662,8 @@ class Scheduler(
             or recv_req.session_params.id is None
             or recv_req.session_params.id not in self.sessions
         ):
-            if recv_req.input_embeds is not None:
-                # Generate fake input_ids based on the length of input_embeds
-                seq_length = len(recv_req.input_embeds)
-                fake_input_ids = [1] * seq_length
-                recv_req.input_ids = fake_input_ids
-
-            if recv_req.bootstrap_port is None:
-                # Use default bootstrap port
-                recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
-
-            req = Req(
-                recv_req.rid,
-                recv_req.input_text,
-                recv_req.input_ids,
-                recv_req.sampling_params,
-                return_logprob=recv_req.return_logprob,
-                top_logprobs_num=recv_req.top_logprobs_num,
-                token_ids_logprob=recv_req.token_ids_logprob,
-                stream=recv_req.stream,
-                lora_id=recv_req.lora_id,
-                input_embeds=recv_req.input_embeds,
-                custom_logit_processor=recv_req.custom_logit_processor,
-                require_reasoning=recv_req.require_reasoning,
-                return_hidden_states=recv_req.return_hidden_states,
-                return_routed_experts=recv_req.return_routed_experts,
-                eos_token_ids=self.model_config.hf_eos_token_id,
-                bootstrap_host=recv_req.bootstrap_host,
-                bootstrap_port=recv_req.bootstrap_port,
-                bootstrap_room=recv_req.bootstrap_room,
-                disagg_mode=self.disaggregation_mode,
-                data_parallel_rank=recv_req.data_parallel_rank,
-                vocab_size=self.model_config.vocab_size,
-                priority=recv_req.priority,
-                metrics_collector=(
-                    self.metrics_collector if self.enable_metrics else None
-                ),
-                routing_key=recv_req.routing_key,
-                http_worker_ipc=recv_req.http_worker_ipc,
-                dllm_config=self.dllm_config,
-            )
-            req.tokenizer = self.tokenizer
+            req = self._build_req_from_generate_request(recv_req)
+            self._prepare_stateful_draft_req(recv_req, req)
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode

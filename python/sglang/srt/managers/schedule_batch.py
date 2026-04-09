@@ -545,6 +545,8 @@ class Req(ReqDllmMixin):
         routing_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
+        draft_session_id: Optional[str] = None,
+        draft_stateful_mode: bool = False,
     ):
         # Input and output info
         self.rid = rid
@@ -560,6 +562,8 @@ class Req(ReqDllmMixin):
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
         self.fill_ids = []
         self.session_id = session_id
+        self.draft_session_id = draft_session_id
+        self.draft_stateful_mode = draft_stateful_mode
         self.input_embeds = input_embeds
 
         # For req-level memory management
@@ -899,6 +903,13 @@ class Req(ReqDllmMixin):
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
         max_prefix_len = max(max_prefix_len, 0)
         token_ids = self.fill_ids[:max_prefix_len]
+
+        # Decoupled drafter owns its session KV continuation explicitly and does not rely
+        # on tree-cache prefix matching, even for the first round.
+        if self.draft_stateful_mode:
+            self.cache_protected_len = len(self.prefix_indices)
+            self.set_extend_input_len(len(self.fill_ids) - len(self.prefix_indices))
+            return
 
         if tree_cache is not None:
             match_result = tree_cache.match_prefix(

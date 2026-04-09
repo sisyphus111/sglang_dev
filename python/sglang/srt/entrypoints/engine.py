@@ -70,6 +70,8 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     parse_remote_instance_transfer_engine_info_from_scheduler_infos,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.speculative.decoupled_spec_io import DraftRequest, DraftResult
+from sglang.srt.speculative.draft_service import LocalDrafterService
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.utils import (
@@ -215,6 +217,14 @@ class Engine(EngineBase):
             parse_remote_instance_transfer_engine_info_from_scheduler_infos(
                 scheduler_infos
             )
+        )
+        self.drafter_service = (
+            LocalDrafterService(
+                tokenizer_manager=self.tokenizer_manager,
+                max_model_len=self.tokenizer_manager.context_len,
+            )
+            if spec_algorithm.is_decoupled_draft()
+            else None
         )
 
         # Initialize ZMQ sockets
@@ -534,6 +544,40 @@ class Engine(EngineBase):
         """
         obj = CloseSessionReqInput(session_id=session_id)
         self.loop.run_until_complete(self.tokenizer_manager.close_session(obj, None))
+
+    def handle_draft_request(self, draft_request: DraftRequest) -> DraftResult:
+        if self.drafter_service is None:
+            raise ValueError(
+                "handle_draft_request is only available for decoupled_draft engines"
+            )
+        return self.loop.run_until_complete(
+            self.drafter_service.handle_draft_request(draft_request)
+        )
+
+    def terminate_draft_request(
+        self,
+        request_id: str,
+        draft_round_id_upper_bound: Optional[int] = None,
+    ) -> None:
+        if self.drafter_service is None:
+            raise ValueError(
+                "terminate_draft_request is only available for decoupled_draft engines"
+            )
+        self.loop.run_until_complete(
+            self.drafter_service.terminate_draft_request(
+                request_id,
+                draft_round_id_upper_bound=draft_round_id_upper_bound,
+            )
+        )
+
+    def release_draft_session(self, request_id: str) -> None:
+        if self.drafter_service is None:
+            raise ValueError(
+                "release_draft_session is only available for decoupled_draft engines"
+            )
+        self.loop.run_until_complete(
+            self.drafter_service.release_draft_session(request_id)
+        )
 
     def start_profile(self, **kwargs):
         self.loop.run_until_complete(self.tokenizer_manager.start_profile(**kwargs))
