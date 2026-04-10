@@ -16,6 +16,7 @@ import ray
 import sglang as sgl
 
 from run_decoupled_spec import allocate_demo_gpus
+from run_decoupled_spec import init_demo_ray
 from run_decoupled_spec import launch_drafter_actor
 from run_decoupled_spec import launch_verifier
 from run_decoupled_spec import RAY_NAMESPACE
@@ -150,11 +151,12 @@ def build_decode_engine(args: argparse.Namespace) -> sgl.Engine:
 def run_decoupled(args: argparse.Namespace) -> ModeResult:
     drafter_actor = None
     verifier = None
+    ray_runtime = None
     original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
     try:
         draft_gpu_ids, target_gpu_ids = allocate_demo_gpus(args)
         args.draft_gpu_ids = draft_gpu_ids
-        ray.init(ignore_reinit_error=True, namespace=RAY_NAMESPACE)
+        ray_runtime = init_demo_ray(RAY_NAMESPACE)
         drafter_actor, drafter_actor_name = launch_drafter_actor(args)
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(target_gpu_ids)
         verifier = launch_verifier(
@@ -164,6 +166,9 @@ def run_decoupled(args: argparse.Namespace) -> ModeResult:
             args.target_tp_size,
             args.num_speculative_steps,
             args.num_speculative_steps + 1,
+            draft_backend_process_kwargs={
+                "ray_init_kwargs": ray_runtime.build_init_kwargs()
+            },
         )
         result = _generate_and_measure(verifier, args)
         result.mode = "decoupled_spec"
@@ -178,6 +183,8 @@ def run_decoupled(args: argparse.Namespace) -> ModeResult:
                 ray.kill(drafter_actor, no_restart=True)
         if ray.is_initialized():
             ray.shutdown()
+        if ray_runtime is not None:
+            ray_runtime.stop()
         if original_cuda_visible_devices is None:
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         else:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import faulthandler
 import logging
 import signal
+import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -34,24 +35,42 @@ def _get_ray() -> Any:
     return ray
 
 
-def _maybe_init_ray() -> None:
+def _maybe_init_ray(ray_init_kwargs: Optional[dict[str, Any]] = None) -> None:
     ray = _get_ray()
     if ray.is_initialized():
         return
-    ray.init(
-        address="auto",
-        ignore_reinit_error=True,
-        log_to_driver=False,
-        logging_level=logging.ERROR,
-    )
+    init_kwargs = dict(ray_init_kwargs or {})
+    init_kwargs.setdefault("address", "auto")
+    init_kwargs.setdefault("ignore_reinit_error", True)
+    init_kwargs.setdefault("log_to_driver", False)
+    init_kwargs.setdefault("logging_level", logging.ERROR)
+    ray.init(**init_kwargs)
 
 
 def _resolve_actor_handles(
     actor_names: list[str],
     namespace: str | None = None,
+    *,
+    timeout_s: float = 10.0,
+    poll_interval_s: float = 0.5,
 ) -> list[Any]:
     ray = _get_ray()
-    return [ray.get_actor(actor_name, namespace=namespace) for actor_name in actor_names]
+    deadline = time.monotonic() + timeout_s
+    last_error = None
+
+    while True:
+        try:
+            return [
+                ray.get_actor(actor_name, namespace=namespace)
+                for actor_name in actor_names
+            ]
+        except ValueError as exc:
+            last_error = exc
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(poll_interval_s)
+
+    raise last_error
 
 
 @dataclass
@@ -369,6 +388,8 @@ def run_draft_backend_process(
     *,
     draft_actor_names: list[str] | None = None,
     draft_actor_namespace: str | None = None,
+    ray_init_kwargs: dict[str, Any] | None = None,
+    actor_lookup_timeout_s: float = 10.0,
     draft_backend_manager_class=DraftBackendManager,
 ) -> None:
     _ = port_args
@@ -379,7 +400,7 @@ def run_draft_backend_process(
     parent_process = psutil.Process().parent()
 
     try:
-        _maybe_init_ray()
+        _maybe_init_ray(ray_init_kwargs=ray_init_kwargs)
         ipc_config = port_args.draft_backend_ipc_config
         if ipc_config is None:
             raise ValueError("Draft backend IPC config is not configured")
@@ -391,6 +412,7 @@ def run_draft_backend_process(
         draft_actor_handles = _resolve_actor_handles(
             draft_actor_names,
             namespace=draft_actor_namespace,
+            timeout_s=actor_lookup_timeout_s,
         )
         manager = draft_backend_manager_class(
             draft_actor_handles=draft_actor_handles,

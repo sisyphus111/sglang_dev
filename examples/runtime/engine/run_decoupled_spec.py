@@ -12,7 +12,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import socket
+import subprocess
+import sys
 import time
+from dataclasses import dataclass
 
 import ray
 import sglang as sgl
@@ -37,6 +41,34 @@ Requirements:
 - Return only one complete C++17 code block.
 - Do not include extra explanation.
 """
+
+
+@dataclass
+class DemoRayRuntime:
+    address: str
+    namespace: str
+    head_process: subprocess.Popen | None = None
+
+    def build_init_kwargs(self) -> dict[str, object]:
+        return {
+            "address": self.address,
+            "namespace": self.namespace,
+            "ignore_reinit_error": True,
+            "log_to_driver": False,
+            "logging_level": "ERROR",
+        }
+
+    def stop(self) -> None:
+        if self.head_process is None:
+            return
+        if self.head_process.poll() is not None:
+            return
+        self.head_process.terminate()
+        try:
+            self.head_process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.head_process.kill()
+            self.head_process.wait(timeout=10)
 
 
 def parse_args() -> argparse.Namespace:
@@ -95,6 +127,72 @@ def parse_args() -> argparse.Namespace:
         help="Prompt used for the end-to-end verifier generation request.",
     )
     return parser.parse_args()
+
+
+def _pick_free_local_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(1)
+        return int(sock.getsockname()[1])
+
+
+def _start_local_ray_head(port: int) -> subprocess.Popen:
+    command = [
+        sys.executable,
+        "-m",
+        "ray",
+        "start",
+        "--head",
+        f"--port={port}",
+        "--node-ip-address=127.0.0.1",
+        "--include-dashboard=false",
+        "--disable-usage-stats",
+        "--block",
+    ]
+    return subprocess.Popen(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+
+def init_demo_ray(namespace: str) -> DemoRayRuntime:
+    port = _pick_free_local_port()
+    address = f"127.0.0.1:{port}"
+    head_process = _start_local_ray_head(port)
+    deadline = time.monotonic() + 30
+    last_error = None
+
+    while time.monotonic() < deadline:
+        try:
+            ray.init(
+                address=address,
+                namespace=namespace,
+                ignore_reinit_error=True,
+                log_to_driver=False,
+                logging_level="ERROR",
+            )
+            return DemoRayRuntime(
+                address=address,
+                namespace=namespace,
+                head_process=head_process,
+            )
+        except Exception as exc:
+            last_error = exc
+            if head_process.poll() is not None:
+                break
+            time.sleep(0.5)
+
+    head_process.terminate()
+    try:
+        head_process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        head_process.kill()
+        head_process.wait(timeout=10)
+    raise RuntimeError(
+        f"Failed to start demo Ray head at {address}: {last_error!r}"
+    ) from last_error
 
 
 @ray.remote
@@ -188,6 +286,7 @@ def launch_verifier(
     target_tp_size: int,
     speculative_num_steps: int,
     speculative_num_draft_tokens: int,
+    draft_backend_process_kwargs: dict[str, object] | None = None,
 ) -> sgl.Engine:
     return sgl.Engine(
         model_path=target_model_path,
@@ -197,6 +296,7 @@ def launch_verifier(
         speculative_num_draft_tokens=speculative_num_draft_tokens,
         draft_actor_names=[draft_actor_name],
         draft_actor_namespace=draft_actor_namespace,
+        draft_backend_process_kwargs=draft_backend_process_kwargs,
     )
 
 
@@ -225,11 +325,12 @@ def main() -> None:
     args = parse_args()
     drafter_actor = None
     verifier = None
+    ray_runtime = None
     original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
     try:
         draft_gpu_ids, target_gpu_ids = allocate_demo_gpus(args)
         args.draft_gpu_ids = draft_gpu_ids
-        ray.init(ignore_reinit_error=True, namespace=RAY_NAMESPACE)
+        ray_runtime = init_demo_ray(RAY_NAMESPACE)
         drafter_actor, drafter_actor_name = launch_drafter_actor(args)
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(target_gpu_ids)
         verifier = launch_verifier(
@@ -239,6 +340,9 @@ def main() -> None:
             args.target_tp_size,
             args.num_speculative_steps,
             args.num_speculative_steps + 1,
+            draft_backend_process_kwargs={
+                "ray_init_kwargs": ray_runtime.build_init_kwargs()
+            },
         )
         run_end_to_end_generation(verifier, args)
     finally:
@@ -251,6 +355,8 @@ def main() -> None:
                 ray.kill(drafter_actor, no_restart=True)
         if ray.is_initialized():
             ray.shutdown()
+        if ray_runtime is not None:
+            ray_runtime.stop()
         if original_cuda_visible_devices is None:
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         else:
