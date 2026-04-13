@@ -17,6 +17,25 @@ class DraftBackendMessageType(str, Enum):
     REQUEST_TERMINATE = "request_terminate"
 
 
+def build_draft_scheduler_rid(request_id: str) -> str:
+    return f"draft-{request_id}"
+
+
+def build_draft_round_scheduler_rid(request_id: str, draft_round_id: int) -> str:
+    return f"draft-{request_id}-{draft_round_id}"
+
+
+def extract_draft_request_id(scheduler_rid: str) -> str | None:
+    if not scheduler_rid.startswith("draft-"):
+        return None
+
+    remainder = scheduler_rid[len("draft-") :]
+    request_id, separator, round_suffix = remainder.rpartition("-")
+    if separator and round_suffix.isdigit():
+        return request_id
+    return remainder or None
+
+
 @dataclass(frozen=True)
 class DraftLookupKey:
     request_id: str
@@ -32,6 +51,7 @@ class DraftRoute:
 @dataclass
 class DraftRequest:
     request_id: str
+    rid: str = ""
     draft_round_id: int = 0
     scheduler_dp_rank: int = 0
     prompt_token_ids: list[int] = field(default_factory=list)
@@ -54,6 +74,7 @@ class DraftRequest:
 @dataclass
 class DraftResult:
     request_id: str
+    rid: str = ""
     draft_round_id: int = 0
     request_prompt_length: int = 0
     draft_token_ids: list[int] = field(default_factory=list)
@@ -75,7 +96,6 @@ class RequestTerminateReason(str, Enum):
 class RequestTerminateMessage:
     request_id: str
     reason: RequestTerminateReason
-    draft_round_id_upper_bound: Optional[int] = None
 
 
 @dataclass

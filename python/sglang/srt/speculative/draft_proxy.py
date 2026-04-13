@@ -23,10 +23,96 @@ from sglang.srt.speculative.decoupled_spec_io import (
     PollDraftResultsResponse,
     RequestTerminateMessage,
 )
+from sglang.srt.utils.csv_debug_utils import (
+    build_batch_trace_fields,
+    build_process_trace_fields,
+    emit_csv_event,
+    emit_summary,
+)
 from sglang.srt.utils import configure_logger, get_zmq_socket, kill_itself_when_parent_died
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
+
+
+def _summarize_lookup_keys(
+    keys: list[DraftLookupKey],
+    *,
+    max_count: int = 16,
+) -> list[str]:
+    summaries = [
+        f"{key.request_id}:{key.draft_round_id}"
+        for key in keys[:max_count]
+    ]
+    if len(keys) > max_count:
+        summaries.append(f"...(+{len(keys) - max_count})")
+    return summaries
+
+
+def _summarize_requests(
+    requests: list[DraftRequest],
+    *,
+    max_count: int = 16,
+) -> list[dict[str, int | str]]:
+    items = []
+    for request in requests[:max_count]:
+        items.append(
+            {
+                "request_id": request.request_id,
+                "round_id": int(request.draft_round_id),
+                "rid": request.rid,
+                "prompt_len": len(request.prompt_token_ids),
+                "committed_len": len(request.committed_token_ids),
+                "scheduler_dp_rank": int(request.scheduler_dp_rank),
+            }
+        )
+    if len(requests) > max_count:
+        items.append({"request_id": f"...(+{len(requests) - max_count})"})
+    return items
+
+
+def _summarize_results(
+    results: list[DraftResult],
+    *,
+    max_count: int = 16,
+) -> list[dict[str, int | str]]:
+    items = []
+    for result in results[:max_count]:
+        items.append(
+            {
+                "request_id": result.request_id,
+                "round_id": int(result.draft_round_id),
+                "rid": result.rid,
+                "draft_len": len(result.draft_token_ids),
+            }
+        )
+    if len(results) > max_count:
+        items.append({"request_id": f"...(+{len(results) - max_count})"})
+    return items
+
+
+def _emit_draftproxy_batch_event(
+    event: str,
+    *,
+    verify_replica_rank: int | None = None,
+    batch_size: int | None = None,
+    live_req_count: int | None = None,
+    status: str | None = None,
+    message: str | None = None,
+    **extra,
+) -> None:
+    emit_csv_event(
+        "draftproxy",
+        event,
+        server_role="draftproxy",
+        verify_replica_rank=verify_replica_rank,
+        status=status,
+        message=message,
+        batch_size=batch_size,
+        live_req_count=live_req_count,
+        **build_batch_trace_fields(trace_key=None),
+        **extra,
+    )
 
 
 def _get_ray() -> Any:
@@ -77,6 +163,8 @@ def _resolve_actor_handles(
 class InflightDraft:
     draft_index: int
     object_ref: Any
+    submit_ts: float
+    rid: str
 
 
 @dataclass
@@ -109,24 +197,58 @@ class DraftProxy:
         self.request_routes[request_id] = route
         return route
 
-    def _release_inflight(self, key: DraftLookupKey) -> None:
+    def _release_inflight(self, key: DraftLookupKey) -> InflightDraft | None:
         inflight = self.inflight_requests.pop(key, None)
         if inflight is None:
-            return
+            return None
         draft_index = int(inflight.draft_index)
         if 0 <= draft_index < len(self.inflight_per_index):
             self.inflight_per_index[draft_index] = max(
                 0, self.inflight_per_index[draft_index] - 1
             )
+        return inflight
 
-    def submit_request(self, request: DraftRequest, object_ref: Any) -> DraftRoute:
-        route = self.acquire_route(request.request_id)
-        self.inflight_requests[request.key] = InflightDraft(
-            draft_index=route.draft_index,
-            object_ref=object_ref,
-        )
-        self.inflight_per_index[route.draft_index] += 1
-        return route
+    def plan_routes(
+        self, requests: list[DraftRequest]
+    ) -> list[tuple[DraftRequest, DraftRoute]]:
+        if not requests:
+            return []
+        if not self.draft_actor_handles:
+            raise ValueError("DraftProxy has no registered draft actor handles")
+
+        planned_load = list(self.inflight_per_index)
+        routed_requests: list[tuple[DraftRequest, DraftRoute]] = []
+        for request in requests:
+            route = self.request_routes.get(request.request_id)
+            if route is None:
+                best_idx = min(
+                    range(len(self.draft_actor_handles)),
+                    key=lambda i: (planned_load[i], i),
+                )
+                route = DraftRoute(request_id=request.request_id, draft_index=best_idx)
+                self.request_routes[request.request_id] = route
+            planned_load[route.draft_index] += 1
+            routed_requests.append((request, route))
+        return routed_requests
+
+    def dispatch_batch(
+        self,
+        route: DraftRoute,
+        requests: list[DraftRequest],
+    ) -> None:
+        if not requests:
+            return
+        actor_handle = self.draft_actor_handles[route.draft_index]
+        submit_ts = time.perf_counter()
+        object_ref = actor_handle.handle_draft_requests.remote(requests)
+        for request in requests:
+            self.inflight_requests[request.key] = InflightDraft(
+                draft_index=route.draft_index,
+                object_ref=object_ref,
+                submit_ts=submit_ts,
+                rid=request.rid,
+            )
+            self.inflight_per_index[route.draft_index] += 1
 
     def peek_ready_results(
         self,
@@ -157,41 +279,20 @@ class DraftProxy:
                 self.ready_results.pop(key, None)
 
     def terminate_request(self, message: RequestTerminateMessage) -> None:
-        upper_bound = message.draft_round_id_upper_bound
+        route = self.request_routes.get(message.request_id)
+        if route is not None:
+            actor_handle = self.draft_actor_handles[route.draft_index]
+            actor_handle.terminate_draft_request.remote(message.request_id)
+
         for key in list(self.inflight_requests):
-            if key.request_id != message.request_id:
-                continue
-            if upper_bound is not None and key.draft_round_id > upper_bound:
-                continue
-            self._release_inflight(key)
+            if key.request_id == message.request_id:
+                self._release_inflight(key)
 
         for key in list(self.ready_results):
-            if key.request_id != message.request_id:
-                continue
-            if upper_bound is not None and key.draft_round_id > upper_bound:
-                continue
-            self.ready_results.pop(key, None)
+            if key.request_id == message.request_id:
+                self.ready_results.pop(key, None)
 
-        has_newer_inflight = (
-            any(
-                key.request_id == message.request_id
-                and key.draft_round_id > upper_bound
-                for key in self.inflight_requests
-            )
-            if upper_bound is not None
-            else False
-        )
-        has_newer_ready = (
-            any(
-                key.request_id == message.request_id
-                and key.draft_round_id > upper_bound
-                for key in self.ready_results
-            )
-            if upper_bound is not None
-            else False
-        )
-        if upper_bound is None or (not has_newer_inflight and not has_newer_ready):
-            self.release_request(message.request_id)
+        self.release_request(message.request_id)
 
     def complete_request(
         self,
@@ -249,11 +350,50 @@ class DraftBackendManager:
             self.context.term()
 
     def _submit_draft_requests(self, requests: list[DraftRequest]) -> None:
-        for request in requests:
-            route = self.proxy.acquire_route(request.request_id)
-            actor_handle = self.proxy.draft_actor_handles[route.draft_index]
-            object_ref = actor_handle.handle_draft_request.remote(request)
-            self.proxy.submit_request(request, object_ref)
+        if requests:
+            _emit_draftproxy_batch_event(
+                "draftproxy_submit_batch_received",
+                verify_replica_rank=requests[0].scheduler_dp_rank,
+                batch_size=len(requests),
+                live_req_count=len(requests),
+                status="received",
+                message="draftproxy received a submit batch from verify scheduler",
+                inflight_total=len(self.proxy.inflight_requests),
+                ready_total=len(self.proxy.ready_results),
+                pending_poll_ranks=sorted(self.pending_poll_keys),
+                requests=_summarize_requests(requests),
+            )
+        routed_requests = self.proxy.plan_routes(requests)
+        requests_by_index: dict[int, list[DraftRequest]] = {}
+        routes_by_index: dict[int, DraftRoute] = {}
+        for request, route in routed_requests:
+            requests_by_index.setdefault(route.draft_index, []).append(request)
+            routes_by_index[route.draft_index] = route
+        for draft_index, grouped_requests in sorted(requests_by_index.items()):
+            self.proxy.dispatch_batch(routes_by_index[draft_index], grouped_requests)
+        if requests:
+            _emit_draftproxy_batch_event(
+                "draftproxy_submit_batch_finished",
+                verify_replica_rank=requests[0].scheduler_dp_rank,
+                batch_size=len(requests),
+                live_req_count=len(self.proxy.inflight_requests),
+                status="submitted",
+                message="draftproxy finished routing a submit batch",
+                inflight_total=len(self.proxy.inflight_requests),
+                ready_total=len(self.proxy.ready_results),
+                inflight_per_actor=list(self.proxy.inflight_per_index),
+                requests=_summarize_requests(requests),
+            )
+            emit_summary(
+                logger,
+                key=f"draftproxy.submit.{requests[0].scheduler_dp_rank}",
+                component="draftproxy",
+                event="draftproxy_submit_summary",
+                message="draftproxy submitted batch",
+                server_role="draftproxy",
+                verify_replica_rank=requests[0].scheduler_dp_rank,
+                batch_size=len(requests),
+            )
 
     def _collect_completed_drafts(self) -> None:
         inflight_items = list(self.proxy.inflight_requests.items())
@@ -261,7 +401,20 @@ class DraftBackendManager:
             return
 
         ray = _get_ray()
-        object_refs = [inflight.object_ref for _, inflight in inflight_items]
+        ref_to_entries: dict[Any, list[tuple[DraftLookupKey, InflightDraft]]] = {}
+        for key, inflight in inflight_items:
+            ref_to_entries.setdefault(inflight.object_ref, []).append((key, inflight))
+        object_refs = list(ref_to_entries)
+        _emit_draftproxy_batch_event(
+            "draftproxy_collect_completed_started",
+            batch_size=len(object_refs),
+            live_req_count=len(inflight_items),
+            status="polling",
+            message="draftproxy started polling inflight draft object refs",
+            inflight_total=len(self.proxy.inflight_requests),
+            inflight_per_actor=list(self.proxy.inflight_per_index),
+            inflight_keys=_summarize_lookup_keys([key for key, _ in inflight_items]),
+        )
         ready_refs, _ = ray.wait(
             object_refs,
             num_returns=len(object_refs),
@@ -270,29 +423,74 @@ class DraftBackendManager:
         if not ready_refs:
             return
 
-        ref_to_key = {inflight.object_ref: key for key, inflight in inflight_items}
+        _emit_draftproxy_batch_event(
+            "draftproxy_collect_completed_ready",
+            batch_size=len(ready_refs),
+            live_req_count=sum(len(ref_to_entries[ref]) for ref in ready_refs),
+            status="ready",
+            message="draftproxy found completed draft object refs",
+            inflight_total=len(self.proxy.inflight_requests),
+            inflight_per_actor=list(self.proxy.inflight_per_index),
+        )
+
+        completed_results: list[DraftResult] = []
         for object_ref in ready_refs:
-            key = ref_to_key.get(object_ref)
-            if key is None:
+            entries = ref_to_entries.get(object_ref, [])
+            if not entries:
                 continue
 
-            result = ray.get(object_ref)
-            if not isinstance(result, DraftResult):
+            raw_results = ray.get(object_ref)
+            if not isinstance(raw_results, list):
                 raise RuntimeError(
-                    f"Draft backend received unexpected result type: {type(result)!r}"
+                    "Draft backend received unexpected batch result type: "
+                    f"{type(raw_results)!r}"
                 )
-            if result.request_id != key.request_id:
+            results = [result for result in raw_results if isinstance(result, DraftResult)]
+            if len(results) != len(raw_results):
                 raise RuntimeError(
-                    "Draft backend result request_id mismatch: "
-                    f"{result.request_id} != {key.request_id}"
+                    "Draft backend received unexpected item inside batch result"
                 )
-            if result.draft_round_id != key.draft_round_id:
+            results_by_key = {result.key: result for result in results}
+            if len(results_by_key) != len(results):
                 raise RuntimeError(
-                    "Draft backend result round mismatch: "
-                    f"{result.draft_round_id} != {key.draft_round_id}"
+                    "Draft backend batch returned duplicate DraftLookupKey values"
                 )
-
-            self.proxy.complete_request(key, result)
+            for key, inflight in entries:
+                result = results_by_key.get(key)
+                if result is None:
+                    raise RuntimeError(
+                        "Draft backend batch result missing key: "
+                        f"{key.request_id}:{key.draft_round_id}"
+                    )
+                expected_rid = inflight.rid
+                if result.rid != expected_rid:
+                    raise RuntimeError(
+                        "Draft backend result rid mismatch: "
+                        f"{result.rid!r} != {expected_rid!r}"
+                    )
+                submit_to_ready_ms = (time.perf_counter() - inflight.submit_ts) * 1000
+                self.proxy.complete_request(key, result)
+                completed_results.append(result)
+                # print(
+                #     "[decoupled-draft-collect] "
+                #     f"request_id={key.request_id} "
+                #     f"draft_round_id={key.draft_round_id} "
+                #     f"draft_index={inflight.draft_index} "
+                #     f"submit_to_collect_ms={submit_to_ready_ms:.3f}",
+                #     flush=True,
+                # )
+        if completed_results:
+            _emit_draftproxy_batch_event(
+                "draftproxy_collect_completed_finished",
+                batch_size=len(completed_results),
+                live_req_count=len(completed_results),
+                status="completed",
+                message="draftproxy finished handling completed draft results",
+                inflight_total=len(self.proxy.inflight_requests),
+                ready_total=len(self.proxy.ready_results),
+                inflight_per_actor=list(self.proxy.inflight_per_index),
+                results=_summarize_results(completed_results),
+            )
 
     def _send_poll_response(
         self,
@@ -303,6 +501,18 @@ class DraftBackendManager:
         keys_to_pop = [result.key for result in ready_results]
         popped_results = self.proxy.pop_ready_results(keys_to_pop)
         response = PollDraftResultsResponse(results=popped_results)
+        if popped_results:
+            emit_csv_event(
+                "draftproxy",
+                "draftproxy_poll_response",
+                server_role="draftproxy",
+                verify_replica_rank=target_dp_rank,
+                batch_size=len(popped_results),
+                live_req_count=len(popped_results),
+                message="draftproxy sent poll response",
+                requested_keys=_summarize_lookup_keys(keys),
+                returned_results=_summarize_results(popped_results),
+            )
         target_socket = self.send_to_scheduler.get(target_dp_rank)
         if target_socket is None:
             raise RuntimeError(
@@ -317,6 +527,18 @@ class DraftBackendManager:
             if not missing_keys:
                 self._send_poll_response(target_dp_rank, keys)
                 continue
+            _emit_draftproxy_batch_event(
+                "draftproxy_pending_poll_still_waiting",
+                verify_replica_rank=target_dp_rank,
+                batch_size=len(keys),
+                live_req_count=len(missing_keys),
+                status="waiting",
+                message="draftproxy pending poll is still waiting for draft results",
+                requested_keys=_summarize_lookup_keys(keys),
+                missing_keys=_summarize_lookup_keys(missing_keys),
+                ready_total=len(self.proxy.ready_results),
+                inflight_total=len(self.proxy.inflight_requests),
+            )
             next_pending_poll_keys[target_dp_rank] = keys
         self.pending_poll_keys = next_pending_poll_keys
 
@@ -329,6 +551,19 @@ class DraftBackendManager:
         if not missing_keys:
             self._send_poll_response(source_dp_rank, poll_request.keys)
             return
+        emit_csv_event(
+            "draftproxy",
+            "draftproxy_poll_waiting",
+            server_role="draftproxy",
+            verify_replica_rank=source_dp_rank,
+            batch_size=len(poll_request.keys),
+            live_req_count=len(missing_keys),
+            message="draftproxy is waiting for missing draft results",
+            requested_keys=_summarize_lookup_keys(poll_request.keys),
+            missing_keys=_summarize_lookup_keys(missing_keys),
+            ready_total=len(self.proxy.ready_results),
+            inflight_total=len(self.proxy.inflight_requests),
+        )
         self.pending_poll_keys[source_dp_rank] = list(poll_request.keys)
 
     def _handle_proxy_message(
@@ -352,10 +587,6 @@ class DraftBackendManager:
             message.message_type == DraftBackendMessageType.REQUEST_TERMINATE
             and message.terminate is not None
         ):
-            route = self.proxy.request_routes.get(message.terminate.request_id)
-            if route is not None:
-                actor_handle = self.proxy.draft_actor_handles[route.draft_index]
-                actor_handle.terminate_draft_request.remote(message.terminate.request_id)
             self.proxy.terminate_request(message.terminate)
             return
         raise RuntimeError(
@@ -418,6 +649,15 @@ def run_draft_backend_process(
             draft_actor_handles=draft_actor_handles,
             ipc_config=ipc_config,
         )
+        emit_summary(
+            logger,
+            key="draftproxy.start",
+            component="draftproxy",
+            event="draftproxy_started",
+            message="draftproxy process started",
+            server_role="draftproxy",
+            **build_process_trace_fields(trace_key="draftproxy:start"),
+        )
         if pipe_writer is not None:
             pipe_writer.send({"status": "ready"})
         manager.event_loop()
@@ -429,4 +669,13 @@ def run_draft_backend_process(
                 pass
         traceback = get_exception_traceback()
         logger.error("Draft backend hit an exception: %s", traceback)
+        emit_csv_event(
+            "draftproxy",
+            "draftproxy_exception",
+            server_role="draftproxy",
+            status="error",
+            message="draft backend process hit an exception",
+            **build_process_trace_fields(trace_key=None),
+            traceback=traceback,
+        )
         parent_process.send_signal(signal.SIGQUIT)

@@ -215,10 +215,6 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     modalities: Optional[List[str]] = None
     # Session info for continual prompting
     session_params: Optional[Union[List[Dict], Dict]] = None
-    # Drafter-only stateful KV session identifier.
-    draft_session_id: Optional[str] = None
-    # Whether the request should reuse drafter session KV state.
-    draft_stateful_mode: bool = False
 
     # The path to the LoRA adaptors
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
@@ -262,7 +258,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     no_logs: bool = False
 
     # For custom metric labels
-    custom_labels: Optional[Dict[str, str]] = None
+    custom_labels: Optional[Union[List[Dict[str, str]], Dict[str, str]]] = None
 
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
@@ -683,9 +679,11 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             priority=self.priority,
             extra_key=self.extra_key,
             no_logs=self.no_logs,
-            custom_labels=self.custom_labels,
-            draft_session_id=self.draft_session_id,
-            draft_stateful_mode=self.draft_stateful_mode,
+            custom_labels=(
+                self.custom_labels[i]
+                if isinstance(self.custom_labels, list)
+                else self.custom_labels
+            ),
             return_bytes=self.return_bytes,
             return_entropy=self.return_entropy,
             external_trace_header=self.external_trace_header,
@@ -731,10 +729,6 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Session info for continual prompting
     session_params: Optional[SessionParams] = None
-    # Drafter-only stateful KV session identifier.
-    draft_session_id: Optional[str] = None
-    # Whether the request should reuse drafter session KV state.
-    draft_stateful_mode: bool = False
 
     # LoRA related
     lora_id: Optional[str] = None  # None means just use the base model
@@ -765,6 +759,9 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
+
+    # Custom labels propagated from GenerateReqInput.
+    custom_labels: Optional[Dict[str, str]] = None
 
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
@@ -1653,7 +1650,7 @@ class CloseSessionReqInput(BaseReq):
 
 @dataclass
 class ReleaseDraftSessionReqInput(BaseReq):
-    draft_session_id: str
+    scheduler_rid: str
 
 
 @dataclass

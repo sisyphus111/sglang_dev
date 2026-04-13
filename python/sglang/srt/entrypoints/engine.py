@@ -139,7 +139,6 @@ class Engine(EngineBase):
     run_scheduler_process_func: Callable = staticmethod(run_scheduler_process)
     run_detokenizer_process_func: Callable = staticmethod(run_detokenizer_process)
     run_draft_backend_func: Optional[Callable] = None
-    run_drafter_scheduler_process_func: Optional[Callable] = None
 
     def __init__(self, **kwargs):
         """
@@ -183,17 +182,6 @@ class Engine(EngineBase):
 
             run_draft_backend_func = run_draft_backend_process
 
-        run_drafter_scheduler_process_func = self.run_drafter_scheduler_process_func
-        if (
-            spec_algorithm.is_decoupled_draft()
-            and run_drafter_scheduler_process_func is None
-        ):
-            from sglang.srt.speculative.draft_scheduler import (
-                run_drafter_scheduler_process,
-            )
-
-            run_drafter_scheduler_process_func = run_drafter_scheduler_process
-
         # Shutdown the subprocesses automatically when the program exits
         atexit.register(self.shutdown)
 
@@ -205,7 +193,6 @@ class Engine(EngineBase):
                 run_scheduler_process_func=self.run_scheduler_process_func,
                 run_detokenizer_process_func=self.run_detokenizer_process_func,
                 run_draft_backend_func=run_draft_backend_func,
-                run_drafter_scheduler_process_func=run_drafter_scheduler_process_func,
                 draft_backend_process_kwargs=draft_backend_process_kwargs,
             )
         )
@@ -545,39 +532,40 @@ class Engine(EngineBase):
         obj = CloseSessionReqInput(session_id=session_id)
         self.loop.run_until_complete(self.tokenizer_manager.close_session(obj, None))
 
-    def handle_draft_request(self, draft_request: DraftRequest) -> DraftResult:
+    async def handle_draft_request(
+        self, draft_request: DraftRequest
+    ) -> DraftResult:
         if self.drafter_service is None:
             raise ValueError(
                 "handle_draft_request is only available for decoupled_draft engines"
             )
-        return self.loop.run_until_complete(
-            self.drafter_service.handle_draft_request(draft_request)
-        )
+        return await self.drafter_service.handle_draft_request(draft_request)
 
-    def terminate_draft_request(
+    async def handle_draft_requests(
+        self, draft_requests: list[DraftRequest]
+    ) -> list[DraftResult]:
+        if self.drafter_service is None:
+            raise ValueError(
+                "handle_draft_requests is only available for decoupled_draft engines"
+            )
+        return await self.drafter_service.handle_draft_requests(draft_requests)
+
+    async def terminate_draft_request(
         self,
         request_id: str,
-        draft_round_id_upper_bound: Optional[int] = None,
     ) -> None:
         if self.drafter_service is None:
             raise ValueError(
                 "terminate_draft_request is only available for decoupled_draft engines"
             )
-        self.loop.run_until_complete(
-            self.drafter_service.terminate_draft_request(
-                request_id,
-                draft_round_id_upper_bound=draft_round_id_upper_bound,
-            )
-        )
+        await self.drafter_service.terminate_draft_request(request_id)
 
-    def release_draft_session(self, request_id: str) -> None:
+    async def release_draft_session(self, request_id: str) -> None:
         if self.drafter_service is None:
             raise ValueError(
                 "release_draft_session is only available for decoupled_draft engines"
             )
-        self.loop.run_until_complete(
-            self.drafter_service.release_draft_session(request_id)
-        )
+        await self.drafter_service.release_draft_session(request_id)
 
     def start_profile(self, **kwargs):
         self.loop.run_until_complete(self.tokenizer_manager.start_profile(**kwargs))
@@ -943,25 +931,31 @@ def _set_envs_and_config(server_args: ServerArgs):
                 "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
             )
 
-    if server_args.custom_sigquit_handler is None:
-        # Register the signal handler.
-        # The child processes will send SIGQUIT to this process when any error happens
-        # This process then clean up the whole process tree
-        # Note: This sigquit handler is used in the launch phase, and may be replaced by
-        # the running_phase_sigquit_handler in the tokenizer manager after the grpc server is launched.
-        def launch_phase_sigquit_handler(signum, frame):
-            logger.error(
-                "Received sigquit from a child process. It usually means the child failed."
-            )
-            kill_process_tree(os.getpid())
+    if threading.current_thread() is threading.main_thread():
+        if server_args.custom_sigquit_handler is None:
+            # Register the signal handler.
+            # The child processes will send SIGQUIT to this process when any error happens
+            # This process then clean up the whole process tree
+            # Note: This sigquit handler is used in the launch phase, and may be replaced by
+            # the running_phase_sigquit_handler in the tokenizer manager after the grpc server is launched.
+            def launch_phase_sigquit_handler(signum, frame):
+                logger.error(
+                    "Received sigquit from a child process. It usually means the child failed."
+                )
+                kill_process_tree(os.getpid())
 
-        signal.signal(signal.SIGQUIT, launch_phase_sigquit_handler)
+            signal.signal(signal.SIGQUIT, launch_phase_sigquit_handler)
+        else:
+            # Allow users to register a custom SIGQUIT handler for things like crash dump
+            logger.error(
+                f"Using custom SIGQUIT handler: {server_args.custom_sigquit_handler}"
+            )
+            signal.signal(signal.SIGQUIT, server_args.custom_sigquit_handler)
     else:
-        # Allow users to register a custom SIGQUIT handler for things like crash dump
-        logger.error(
-            f"Using custom SIGQUIT handler: {server_args.custom_sigquit_handler}"
+        logger.warning(
+            "Skipping SIGQUIT handler registration because sgl.Engine is initializing "
+            "outside the main thread."
         )
-        signal.signal(signal.SIGQUIT, server_args.custom_sigquit_handler)
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
@@ -1133,7 +1127,6 @@ def _launch_subprocesses(
     run_scheduler_process_func: Callable,
     run_detokenizer_process_func: Callable,
     run_draft_backend_func: Optional[Callable] = None,
-    run_drafter_scheduler_process_func: Optional[Callable] = None,
     draft_backend_process_kwargs: Optional[dict] = None,
     port_args: Optional[PortArgs] = None,
 ) -> Tuple[TokenizerManager, TemplateManager, Tuple[Dict], PortArgs]:
@@ -1149,14 +1142,7 @@ def _launch_subprocesses(
     if port_args is None:
         port_args = PortArgs.init_new(server_args)
     logger.info(f"{server_args=}")
-
     spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
-    if spec_algorithm.is_decoupled_draft():
-        if run_drafter_scheduler_process_func is None:
-            raise ValueError(
-                "decoupled_draft requires run_drafter_scheduler_process_func to be configured"
-            )
-        run_scheduler_process_func = run_drafter_scheduler_process_func
 
     # Launch scheduler processes
     scheduler_procs, scheduler_pipe_readers = _launch_scheduler_processes(

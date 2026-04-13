@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import logging
 import time
-from collections import deque
-from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -14,23 +12,15 @@ from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.decoupled_spec_io import (
-    DraftBackendClient,
-    DraftBackendMessage,
-    DraftBackendMessageType,
-    DraftLookupKey,
-    DraftRequest,
     DraftResult,
-    PollDraftResultsRequest,
-    RequestTerminateMessage,
-    RequestTerminateReason,
+    build_draft_scheduler_rid,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
 from sglang.srt.speculative.eagle_worker import EAGLEWorker
-from sglang.srt.utils import broadcast_pyobj
+from sglang.srt.utils.csv_debug_utils import emit_csv_event, emit_summary
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 
 logger = logging.getLogger(__name__)
@@ -195,287 +185,6 @@ def normalize_external_draft_batch_spec_info(batch: ScheduleBatch) -> None:
     )
 
 
-def _iter_live_batch_reqs(batch) -> list:
-    return [req for req in batch.reqs if not req.is_retracted and not req.finished()]
-
-
-def _build_sampling_params_dict(sampling_params) -> dict:
-    params = {
-        "max_new_tokens": sampling_params.max_new_tokens,
-        "temperature": sampling_params.temperature,
-        "top_p": sampling_params.top_p,
-        "top_k": sampling_params.top_k,
-        "min_p": sampling_params.min_p,
-        "frequency_penalty": sampling_params.frequency_penalty,
-        "presence_penalty": sampling_params.presence_penalty,
-        "repetition_penalty": sampling_params.repetition_penalty,
-        "min_new_tokens": sampling_params.min_new_tokens,
-        "n": sampling_params.n,
-        "ignore_eos": sampling_params.ignore_eos,
-        "skip_special_tokens": sampling_params.skip_special_tokens,
-        "spaces_between_special_tokens": sampling_params.spaces_between_special_tokens,
-        "no_stop_trim": sampling_params.no_stop_trim,
-        "custom_params": sampling_params.custom_params,
-        "stream_interval": sampling_params.stream_interval,
-        "logit_bias": sampling_params.logit_bias,
-        "sampling_seed": sampling_params.sampling_seed,
-    }
-    if sampling_params.stop_strs is not None:
-        params["stop"] = sampling_params.stop_strs
-    if sampling_params.stop_token_ids is not None:
-        params["stop_token_ids"] = list(sampling_params.stop_token_ids)
-    if sampling_params.stop_regex_strs is not None:
-        params["stop_regex"] = sampling_params.stop_regex_strs
-    if sampling_params.json_schema is not None:
-        params["json_schema"] = sampling_params.json_schema
-    if sampling_params.regex is not None:
-        params["regex"] = sampling_params.regex
-    if sampling_params.ebnf is not None:
-        params["ebnf"] = sampling_params.ebnf
-    if sampling_params.structural_tag is not None:
-        params["structural_tag"] = sampling_params.structural_tag
-    return params
-
-
-@dataclass
-class VerifyDraftSessionState:
-    request_id: str
-    next_draft_round_id: int = 0
-    waiting_keys: deque[DraftLookupKey] = field(default_factory=deque)
-    needs_warmup_decode: bool = False
-
-    def alloc_next_round_id(self) -> int:
-        round_id = int(self.next_draft_round_id)
-        self.next_draft_round_id = round_id + 1
-        return round_id
-
-    def peek_waiting_key(self) -> DraftLookupKey | None:
-        if not self.waiting_keys:
-            return None
-        return self.waiting_keys[0]
-
-    def append_waiting_key(self, waiting_key: DraftLookupKey) -> None:
-        self.waiting_keys.append(waiting_key)
-
-    def pop_waiting_key(self) -> DraftLookupKey | None:
-        if not self.waiting_keys:
-            return None
-        return self.waiting_keys.popleft()
-
-
-@dataclass
-class VerifyCoordinatorState:
-    sessions: dict[str, VerifyDraftSessionState] = field(default_factory=dict)
-    submit_times_by_key: dict[DraftLookupKey, float] = field(default_factory=dict)
-
-
-@dataclass
-class VerifyBatchActions:
-    draft_requests: list[DraftRequest] = field(default_factory=list)
-    terminate_messages: list[RequestTerminateMessage] = field(default_factory=list)
-
-
-class VerifyCoordinator:
-    def __init__(
-        self,
-        *,
-        scheduler_dp_rank: int,
-        num_speculative_steps: int,
-    ) -> None:
-        self.scheduler_dp_rank = int(scheduler_dp_rank)
-        self.num_speculative_steps = int(num_speculative_steps)
-        self.state = VerifyCoordinatorState()
-
-    def get_or_create_session(self, request_id: str) -> VerifyDraftSessionState:
-        session = self.state.sessions.get(request_id)
-        if session is None:
-            session = VerifyDraftSessionState(request_id=request_id)
-            self.state.sessions[request_id] = session
-        return session
-
-    def get_session(self, request_id: str) -> VerifyDraftSessionState | None:
-        return self.state.sessions.get(request_id)
-
-    def alloc_next_round_id(self, request_id: str) -> int:
-        return self.get_or_create_session(request_id).alloc_next_round_id()
-
-    def peek_waiting_key(self, request_id: str) -> DraftLookupKey | None:
-        session = self.get_session(request_id)
-        if session is None:
-            return None
-        return session.peek_waiting_key()
-
-    def append_waiting_key(
-        self, request_id: str, waiting_key: DraftLookupKey
-    ) -> None:
-        self.get_or_create_session(request_id).append_waiting_key(waiting_key)
-
-    def pop_waiting_key(self, request_id: str) -> DraftLookupKey | None:
-        session = self.get_session(request_id)
-        if session is None:
-            return None
-        waiting_key = session.pop_waiting_key()
-        if not session.waiting_keys and not session.needs_warmup_decode:
-            self.state.sessions.pop(request_id, None)
-        return waiting_key
-
-    def mark_warmup_decode(self, request_id: str) -> None:
-        self.get_or_create_session(request_id).needs_warmup_decode = True
-
-    def clear_warmup_decode(self, request_id: str) -> None:
-        session = self.get_session(request_id)
-        if session is None:
-            return
-        session.needs_warmup_decode = False
-        if not session.waiting_keys:
-            self.state.sessions.pop(request_id, None)
-
-    def needs_warmup_decode(self, request_id: str) -> bool:
-        session = self.get_session(request_id)
-        return bool(session is not None and session.needs_warmup_decode)
-
-    def clear_request(self, request_id: str) -> None:
-        self.state.sessions.pop(request_id, None)
-        for key in list(self.state.submit_times_by_key):
-            if key.request_id == request_id:
-                self.state.submit_times_by_key.pop(key, None)
-
-    def record_submit_time(self, waiting_key: DraftLookupKey, submit_ts: float) -> None:
-        self.state.submit_times_by_key[waiting_key] = float(submit_ts)
-
-    def pop_submit_time(self, waiting_key: DraftLookupKey) -> float | None:
-        return self.state.submit_times_by_key.pop(waiting_key, None)
-
-    def build_draft_request(self, req, draft_round_id: int) -> DraftRequest:
-        return DraftRequest(
-            request_id=req.rid,
-            draft_round_id=draft_round_id,
-            scheduler_dp_rank=self.scheduler_dp_rank,
-            prompt_token_ids=list(req.origin_input_ids),
-            committed_token_ids=list(req.output_ids),
-            num_speculative_steps=self.num_speculative_steps,
-            sampling_params=_build_sampling_params_dict(req.sampling_params),
-        )
-
-    def register_submitted_request(
-        self,
-        req,
-        draft_request: DraftRequest,
-        needs_warmup_decode: bool,
-        submit_ts: float,
-    ) -> None:
-        self.append_waiting_key(req.rid, draft_request.key)
-        self.record_submit_time(draft_request.key, submit_ts)
-        if needs_warmup_decode:
-            self.mark_warmup_decode(req.rid)
-        setattr(req, "needs_warmup_decode", needs_warmup_decode)
-        setattr(req, "draft_result", None)
-        self.get_or_create_session(req.rid)
-
-    def build_submit_batch(
-        self,
-        reqs: list,
-        warmup_request_ids: set[str] | None = None,
-    ) -> list[DraftRequest]:
-        draft_requests: list[DraftRequest] = []
-        submit_ts = time.perf_counter()
-        for req in reqs:
-            draft_round_id = self.alloc_next_round_id(req.rid)
-            draft_request = self.build_draft_request(req, draft_round_id)
-            needs_warmup_decode = bool(
-                warmup_request_ids and req.rid in warmup_request_ids
-            )
-            self.register_submitted_request(
-                req,
-                draft_request,
-                needs_warmup_decode=needs_warmup_decode,
-                submit_ts=submit_ts,
-            )
-            draft_requests.append(draft_request)
-        return draft_requests
-
-    def collect_missing_poll_keys(self, live_reqs) -> list[DraftLookupKey]:
-        missing_keys: list[DraftLookupKey] = []
-        for req in live_reqs:
-            session = self.get_session(req.rid)
-            if session is None:
-                continue
-            waiting_key = session.peek_waiting_key()
-            if waiting_key is not None:
-                missing_keys.append(waiting_key)
-        return missing_keys
-
-    def bind_polled_results_to_live_reqs(
-        self,
-        live_reqs,
-        results: list[DraftResult],
-    ) -> list[tuple[DraftResult, float | None]]:
-        bind_records: list[tuple[DraftResult, float | None]] = []
-        results_by_key = {result.key: result for result in results}
-        for req in live_reqs:
-            waiting_key = self.peek_waiting_key(req.rid)
-            if waiting_key is None:
-                setattr(req, "draft_result", None)
-                continue
-
-            draft_result = results_by_key.get(waiting_key)
-            if draft_result is None:
-                raise RuntimeError(
-                    f"Draft result missing for request {req.rid} round {waiting_key.draft_round_id}"
-                )
-            session = self.get_session(req.rid)
-            if session is None:
-                raise RuntimeError(
-                    f"Draft session missing while binding request {req.rid}"
-                )
-            expected_round_id = session.next_draft_round_id - 2
-            if draft_result.key != waiting_key:
-                raise RuntimeError(
-                    f"Draft result key mismatch for request {req.rid}: "
-                    f"{draft_result.key!r} != {waiting_key!r}"
-                )
-            if draft_result.draft_round_id != expected_round_id:
-                raise RuntimeError(
-                    "Draft result round mismatch: "
-                    f"{draft_result.draft_round_id} != expected {expected_round_id}"
-                )
-            submit_ts = self.pop_submit_time(waiting_key)
-            self.pop_waiting_key(req.rid)
-            setattr(req, "draft_result", draft_result)
-            submit_to_result_ms = None
-            if submit_ts is not None:
-                submit_to_result_ms = (time.perf_counter() - submit_ts) * 1000
-            bind_records.append((draft_result, submit_to_result_ms))
-        return bind_records
-    def build_post_batch_actions(self, batch_reqs) -> VerifyBatchActions:
-        actions = VerifyBatchActions()
-        requests_to_submit = []
-        for req in batch_reqs:
-            if req.is_retracted or req.finished():
-                terminate_reason = (
-                    RequestTerminateReason.ABORT
-                    if req.is_retracted
-                    else RequestTerminateReason.FINISHED
-                )
-                actions.terminate_messages.append(
-                    RequestTerminateMessage(
-                        request_id=req.rid,
-                        reason=terminate_reason,
-                    )
-                )
-                self.clear_request(req.rid)
-                continue
-
-            if self.needs_warmup_decode(req.rid):
-                self.clear_warmup_decode(req.rid)
-                setattr(req, "needs_warmup_decode", False)
-
-            requests_to_submit.append(req)
-
-        actions.draft_requests = self.build_submit_batch(requests_to_submit)
-        return actions
-
-
 class VerifyWorker:
     verify = EAGLEWorker.verify
     _mamba_verify_update = EAGLEWorker._mamba_verify_update
@@ -491,7 +200,6 @@ class VerifyWorker:
         moe_dp_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
-        draft_backend_client: DraftBackendClient | None = None,
     ) -> None:
         del gpu_id, moe_ep_rank, moe_dp_rank, nccl_port
         self.server_args = server_args
@@ -511,166 +219,18 @@ class VerifyWorker:
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
-        self.total_accepted_draft_tokens = 0
-        self.total_verified_tokens = 0
-        self.total_verified_reqs = 0
+        self.total_accept_length = 0
+        self.total_num_verified_reqs = 0
         self.total_round_forward_time_ms = 0.0
         self.total_round_forward_ct = 0
         self._last_logged_avg_req_len_bucket = 0
-        self.coordinator = VerifyCoordinator(
-            scheduler_dp_rank=self.dp_rank,
-            num_speculative_steps=self.speculative_num_steps,
-        )
-        self.draft_backend_client = draft_backend_client
-        if self._is_entry_rank() and self.draft_backend_client is None:
-            raise RuntimeError(
-                "Draft backend client is required on decoupled_verify entry rank"
-            )
-
-    def _is_entry_rank(self) -> bool:
-        return self.pp_rank == 0 and self.tp_rank == 0 and self.attn_cp_rank == 0
+        self._last_verify_end_ts: float | None = None
 
     def clear_cache_pool(self):
         return
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         return self.target_worker.update_weights_from_tensor(recv_req)
-
-    def _send_backend_message(self, message: DraftBackendMessage) -> None:
-        if not self._is_entry_rank():
-            return
-        if self.draft_backend_client is None:
-            raise RuntimeError("Draft backend client is not initialized on entry rank")
-        self.draft_backend_client.send_message(message)
-
-    def _recv_poll_response(self) -> list[DraftResult]:
-        if not self._is_entry_rank():
-            return []
-        if self.draft_backend_client is None:
-            raise RuntimeError("Draft backend client is not initialized on entry rank")
-
-        while True:
-            response = self.draft_backend_client.recv_message()
-            if (
-                response.message_type != DraftBackendMessageType.POLL_RESPONSE
-                or response.poll_response is None
-            ):
-                raise RuntimeError(
-                    f"Unexpected draft backend response: {response.message_type}"
-                )
-            return list(response.poll_response.results)
-
-    def _sync_polled_results(
-        self,
-        scheduler: Scheduler,
-        local_results: list[DraftResult] | None,
-    ) -> list[DraftResult]:
-        source_payload = list(local_results or []) if self._is_entry_rank() else []
-        if scheduler.tp_size == 1:
-            return source_payload
-        synced_results = broadcast_pyobj(
-            source_payload,
-            scheduler.tp_group.rank,
-            scheduler.tp_cpu_group,
-            src=scheduler.tp_group.ranks[0],
-        )
-        return list(synced_results)
-
-    def prepare_verify_batch(self, batch: ScheduleBatch, scheduler: Scheduler) -> None:
-        if batch is None or not batch.forward_mode.is_decode():
-            return
-
-        live_reqs = _iter_live_batch_reqs(batch)
-        for req in live_reqs:
-            setattr(req, "draft_result", None)
-            setattr(
-                req,
-                "needs_warmup_decode",
-                self.coordinator.needs_warmup_decode(req.rid),
-            )
-
-        target_reqs = [
-            req
-            for req in live_reqs
-            if not self.coordinator.needs_warmup_decode(req.rid)
-        ]
-        if not target_reqs:
-            return
-
-        missing_keys = self.coordinator.collect_missing_poll_keys(target_reqs)
-        polled_results = None
-        if self._is_entry_rank() and missing_keys:
-            poll_wait_start = time.perf_counter()
-            self._send_backend_message(
-                DraftBackendMessage.from_poll_request(
-                    PollDraftResultsRequest(keys=missing_keys)
-                )
-            )
-            polled_results = self._recv_poll_response()
-            poll_wait_ms = (time.perf_counter() - poll_wait_start) * 1000
-            # print(
-            #     "[decoupled-verify] "
-            #     f"poll_wait_ms={poll_wait_ms:.3f} "
-            #     f"missing_keys={len(missing_keys)} "
-            #     f"ready_results={len(polled_results)}",
-            #     flush=True,
-            # )
-
-        synced_results = self._sync_polled_results(scheduler, polled_results)
-        bind_records = self.coordinator.bind_polled_results_to_live_reqs(
-            target_reqs, synced_results
-        )
-        if self._is_entry_rank():
-            for draft_result, submit_to_result_ms in bind_records:
-                if submit_to_result_ms is None:
-                    continue
-                # print(
-                #     "[decoupled-verify] "
-                #     f"submit_draft_to_result_ms={submit_to_result_ms:.3f} "
-                #     f"rid={draft_result.request_id} "
-                #     f"round={draft_result.draft_round_id}",
-                #     flush=True,
-                # )
-
-    def _submit_draft_requests(self, requests: list[DraftRequest]) -> None:
-        if requests and self._is_entry_rank():
-            self._send_backend_message(DraftBackendMessage.from_submit_draft(requests))
-
-    def _terminate_request(self, message: RequestTerminateMessage) -> None:
-        if self._is_entry_rank():
-            self._send_backend_message(DraftBackendMessage.from_request_terminate(message))
-
-    def abort_request_state(self, request_id: str) -> None:
-        self.coordinator.clear_request(request_id)
-        self._terminate_request(
-            RequestTerminateMessage(
-                request_id=request_id,
-                reason=RequestTerminateReason.ABORT,
-            )
-        )
-
-    def after_process_batch(
-        self,
-        batch: ScheduleBatch,
-        scheduler: Scheduler,
-    ) -> None:
-        if batch.forward_mode.is_extend() and not batch.is_dllm():
-            warmup_request_ids = _get_prefill_batch_warmup_request_ids(batch)
-            reqs_to_submit = [
-                req for req in _iter_live_batch_reqs(batch) if req.is_chunked <= 0
-            ]
-            draft_requests = self.coordinator.build_submit_batch(
-                reqs_to_submit,
-                warmup_request_ids=warmup_request_ids,
-            )
-            self._submit_draft_requests(draft_requests)
-            return
-
-        if batch.forward_mode.is_decode():
-            actions = self.coordinator.build_post_batch_actions(batch.reqs)
-            self._submit_draft_requests(actions.draft_requests)
-            for terminate_message in actions.terminate_messages:
-                self._terminate_request(terminate_message)
 
     def _get_verify_buffers(self, draft_token_num: int):
         if draft_token_num != self.speculative_num_draft_tokens:
@@ -709,6 +269,7 @@ class VerifyWorker:
         draft_result = getattr(req, "draft_result", None)
         is_warmup_decode = bool(getattr(req, "needs_warmup_decode", False))
         verify_window_len = self.speculative_num_draft_tokens
+        verify_replica_rank = self.dp_rank
 
         if draft_result is None:
             if is_warmup_decode:
@@ -717,6 +278,13 @@ class VerifyWorker:
 
         if not draft_result.draft_token_ids:
             return [tail_token] + [pad_token_id] * (verify_window_len - 1)
+
+        expected_rid = build_draft_scheduler_rid(req.rid)
+        if draft_result.rid != expected_rid:
+            raise RuntimeError(
+                "Draft result rid mismatched verifier request: "
+                f"{draft_result.rid!r} != expected {expected_rid!r}"
+            )
 
         request_prompt_length = draft_result.request_prompt_length
         request_total_length = len(req.origin_input_ids) + len(req.output_ids)
@@ -735,19 +303,6 @@ class VerifyWorker:
                 pad_token_id,
             )
 
-        # if self._is_entry_rank():
-        #     print(
-        #         "[decoupled-diagnose] verify anchor mismatch "
-        #         f"rid={req.rid} round={draft_result.draft_round_id} "
-        #         f"tail_token={tail_token} "
-        #         f"draft_anchor_token={draft_result.draft_token_ids[0]} "
-        #         f"prompt_len={len(req.origin_input_ids)} "
-        #         f"committed_len={len(req.output_ids)} "
-        #         f"draft_token_count={len(draft_result.draft_token_ids)} "
-        #         "draft_tokens_head="
-        #         f"{draft_result.draft_token_ids[: min(4, len(draft_result.draft_token_ids))]}",
-        #         flush=True,
-        #     )
         return [tail_token] + [pad_token_id] * (verify_window_len - 1)
 
     def _build_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
@@ -836,9 +391,24 @@ class VerifyWorker:
             #     )
             return result
 
+        verify_input_start = time.perf_counter()
         spec_info = self._build_verify_input(batch)
+        verify_input_duration_ms = (time.perf_counter() - verify_input_start) * 1000
         can_use_full_graph_path = (
             spec_info.draft_token_num == self.speculative_num_draft_tokens
+        )
+        emit_csv_event(
+            "verify",
+            "verify_input_built",
+            server_role="verify",
+            verify_replica_rank=self.dp_rank,
+            batch_size=batch.batch_size(),
+            live_req_count=batch.batch_size(),
+            duration_ms=round(verify_input_duration_ms, 3),
+            draft_token_num=int(spec_info.draft_token_num),
+            spec_steps=int(spec_info.spec_steps),
+            seq_lens_sum=int(spec_info.seq_lens_sum),
+            message="verify worker built EagleVerifyInput",
         )
         verify_start = time.perf_counter()
         logits_output, verify_output, _, can_run_cuda_graph = self.verify(batch, spec_info)
@@ -870,21 +440,17 @@ class VerifyWorker:
             accept_length_per_req_cpu=verify_output.accept_length_per_req_cpu,
             can_run_cuda_graph=can_run_cuda_graph and can_use_full_graph_path,
         )
-
-        verified_reqs = len(verify_output.accept_length_per_req_cpu)
-        accepted_draft_tokens = int(result.num_accepted_tokens)
-        verified_tokens = accepted_draft_tokens + verified_reqs
-        self.total_accepted_draft_tokens += accepted_draft_tokens
-        self.total_verified_tokens += verified_tokens
-        self.total_verified_reqs += verified_reqs
-        avg_tokens_per_round = (
-            self.total_verified_tokens / self.total_verified_reqs
-            if self.total_verified_reqs > 0
+        num_verified_reqs = len(verify_output.accept_length_per_req_cpu)
+        self.total_accept_length += int(result.num_accepted_tokens) + num_verified_reqs
+        self.total_num_verified_reqs += num_verified_reqs
+        avg_accept_length = (
+            self.total_accept_length / self.total_num_verified_reqs
+            if self.total_num_verified_reqs > 0
             else 0.0
         )
         self.total_round_forward_time_ms += round_forward_time_ms
         self.total_round_forward_ct += 1
-        avg_round_forward_time_ms = (
+        avg_forward_time_ms = (
             self.total_round_forward_time_ms / self.total_round_forward_ct
             if self.total_round_forward_ct > 0
             else 0.0
@@ -896,27 +462,49 @@ class VerifyWorker:
             getattr(self.target_worker.model_runner, "graph_runner", None) is not None
         )
         target_graph_can_run = bool(can_run_cuda_graph)
-        # if self._is_entry_rank():
-        #     print(
-        #         "[decoupled-verify] "
-        #         f"accepted_this_round={accepted_draft_tokens} "
-        #         f"avg_tokens_per_round={avg_tokens_per_round:.3f} "
-        #         f"target_disable_cuda_graph={target_disable_cuda_graph} "
-        #         f"target_has_graph_runner={target_has_graph_runner} "
-        #         f"target_graph_can_run={target_graph_can_run} "
-        #         f"verify_can_run_cuda_graph={bool(can_run_cuda_graph)} "
-        #         f"verify_use_full_graph_path={bool(can_use_full_graph_path)} "
-        #         f"avg_round_forward_time_ms={avg_round_forward_time_ms:.3f}",
-        #         flush=True,
-        #     )
+        verify_replica_rank = self.dp_rank
+        emit_csv_event(
+            "verify",
+            "verify_batch_result",
+            server_role="verify",
+            verify_replica_rank=verify_replica_rank,
+            batch_size=num_verified_reqs,
+            live_req_count=num_verified_reqs,
+            duration_ms=round(verify_duration_ms, 3),
+            avg_accept_len=round(avg_accept_length, 6),
+            message="verify batch finished",
+            verify_cuda_graph=bool(can_run_cuda_graph and can_use_full_graph_path),
+            can_use_full_graph_path=can_use_full_graph_path,
+            target_disable_cuda_graph=target_disable_cuda_graph,
+            target_has_graph_runner=target_has_graph_runner,
+            target_graph_can_run=target_graph_can_run,
+            avg_round_forward_time_ms=round(avg_forward_time_ms, 3),
+        )
+        emit_summary(
+            logger,
+            key=f"verify.stats.{verify_replica_rank}",
+            component="verify",
+            event="verify_stats_summary",
+            message=(
+                "verify stats updated "
+                f"avg_accept_length={avg_accept_length:.6f} "
+                f"avg_forward_time_ms={avg_forward_time_ms:.3f}"
+            ),
+            server_role="verify",
+            verify_replica_rank=verify_replica_rank,
+            batch_size=batch_size,
+            avg_accept_length=round(avg_accept_length, 6),
+            avg_forward_time_ms=round(avg_forward_time_ms, 3),
+        )
+        verify_end_ts = time.perf_counter()
+        if self._last_verify_end_ts is not None:
+            verify_to_verify_ms = (verify_end_ts - self._last_verify_end_ts) * 1000
+            # print(
+            #     "[decoupled-verify-gap] "
+            #     f"dp_rank={verify_replica_rank} "
+            #     f"bs={batch_size} "
+            #     f"verify_to_verify_ms={verify_to_verify_ms:.3f}",
+            #     flush=True,
+            # )
+        self._last_verify_end_ts = verify_end_ts
         return result
-
-
-def _get_prefill_batch_warmup_request_ids(batch) -> set[str]:
-    decoding_rids = {req.rid for req in (batch.decoding_reqs or [])}
-    warmup_request_ids = set()
-    for req in _iter_live_batch_reqs(batch):
-        if req.rid in decoding_rids or req.is_chunked > 0:
-            continue
-        warmup_request_ids.add(req.rid)
-    return warmup_request_ids

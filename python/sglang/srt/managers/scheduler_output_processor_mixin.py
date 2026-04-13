@@ -24,6 +24,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.tracing.trace import trace_slice, trace_slice_batch, trace_slice_end
+from sglang.srt.utils.csv_debug_utils import emit_csv_event
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -38,6 +39,27 @@ logger = logging.getLogger(__name__)
 DEFAULT_FORCE_STREAM_INTERVAL = 50
 
 
+def _get_draft_trace_labels(req: Req) -> Optional[dict]:
+    labels = getattr(req, "custom_labels", None)
+    if not isinstance(labels, dict) or labels.get("draft_trace") != "1":
+        return None
+    return labels
+
+
+def _draft_int_label(labels: dict, key: str) -> Optional[int]:
+    value = labels.get(key)
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_len(value) -> int:
+    return 0 if value is None else len(value)
+
+
 def _treat_as_normal_decode(spec_algorithm) -> bool:
     return spec_algorithm.is_none() or spec_algorithm.is_decoupled_draft()
 
@@ -47,6 +69,13 @@ class SchedulerOutputProcessorMixin:
     This class implements the output processing logic for Scheduler.
     We put them into a separate file to make the `scheduler.py` shorter.
     """
+
+    def _maybe_preserve_draft_req(self: Scheduler, req: Req) -> bool:
+        finished_reason = getattr(req, "finished_reason", None)
+        if getattr(finished_reason, "is_error", False):
+            return False
+        preserve = getattr(self.tree_cache, "maybe_preserve_req", None)
+        return bool(preserve is not None and preserve(req))
 
     def _get_storage_backend_type(self) -> str:
         """Get storage backend type from tree_cache."""
@@ -100,7 +129,7 @@ class SchedulerOutputProcessorMixin:
                     req.rid,
                     thread_finish_flag=True,
                 )
-                if not self.maybe_preserve_draft_stateful_req(req):
+                if not self._maybe_preserve_draft_req(req):
                     release_kv_cache(req, self.tree_cache)
 
         # Note: Logprobs should be handled on the prefill engine.
@@ -181,7 +210,7 @@ class SchedulerOutputProcessorMixin:
 
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
-                        if not self.maybe_preserve_draft_stateful_req(req):
+                        if not self._maybe_preserve_draft_req(req):
                             release_kv_cache(req, self.tree_cache)
                         req.time_stats.completion_time = time.perf_counter()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
@@ -316,7 +345,7 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
 
                     if req.finished():
-                        if not self.maybe_preserve_draft_stateful_req(req):
+                        if not self._maybe_preserve_draft_req(req):
                             release_kv_cache(req, self.tree_cache)
                     else:
                         self.tree_cache.cache_unfinished_req(req)
@@ -404,7 +433,7 @@ class SchedulerOutputProcessorMixin:
                 req.output_ids.append(next_token_id)
                 req.check_finished()
                 if req.finished():
-                    if not self.maybe_preserve_draft_stateful_req(req):
+                    if not self._maybe_preserve_draft_req(req):
                         release_kv_cache(req, self.tree_cache)
                     req.time_stats.completion_time = time.perf_counter()
                     break
@@ -427,8 +456,14 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
+        decode_output_process_start = time.perf_counter()
+        copy_done_sync_duration_ms = 0.0
         if result.copy_done is not None:
+            copy_done_sync_start = time.perf_counter()
             result.copy_done.synchronize()
+            copy_done_sync_duration_ms = round(
+                (time.perf_counter() - copy_done_sync_start) * 1000, 3
+            )
 
         logits_output, next_token_ids, can_run_cuda_graph = (
             result.logits_output,
@@ -436,8 +471,13 @@ class SchedulerOutputProcessorMixin:
             result.can_run_cuda_graph,
         )
 
+        next_token_ids_to_list_duration_ms = 0.0
         if _treat_as_normal_decode(batch.spec_algorithm):
+            next_token_ids_to_list_start = time.perf_counter()
             next_token_ids = next_token_ids.tolist()
+            next_token_ids_to_list_duration_ms = round(
+                (time.perf_counter() - next_token_ids_to_list_start) * 1000, 3
+            )
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
         elif batch.is_spec_v2:
@@ -449,12 +489,33 @@ class SchedulerOutputProcessorMixin:
         if self.enable_metrics:
             self.metrics_collector.increment_cuda_graph_pass(value=can_run_cuda_graph)
 
+        free_group_begin_start = time.perf_counter()
         self.token_to_kv_pool_allocator.free_group_begin()
+        free_group_begin_duration_ms = round(
+            (time.perf_counter() - free_group_begin_start) * 1000, 3
+        )
 
         # NOTE: in any case, we should check finish here
         # if finished, also clean up committed kv cache and over-allocated kv cache here
 
         # Check finish condition
+        req_loop_start = time.perf_counter()
+        append_output_duration_ms = 0.0
+        check_finished_duration_ms = 0.0
+        preserve_draft_duration_ms = 0.0
+        preserve_session_lookup_ms = 0.0
+        preserve_session_fetch_ms = 0.0
+        preserve_kv_copy_ms = 0.0
+        preserve_free_overallocated_ms = 0.0
+        preserve_assert_previous_ms = 0.0
+        preserve_session_update_ms = 0.0
+        preserve_req_pool_free_ms = 0.0
+        release_kv_duration_ms = 0.0
+        customized_info_duration_ms = 0.0
+        grammar_duration_ms = 0.0
+        finished_req_count = 0
+        preserved_draft_req_count = 0
+        released_req_count = 0
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             req: Req
 
@@ -466,32 +527,130 @@ class SchedulerOutputProcessorMixin:
 
             new_accepted_len = 1
             if _treat_as_normal_decode(batch.spec_algorithm):
+                append_output_start = time.perf_counter()
                 req.output_ids.append(next_token_id)
+                append_output_duration_ms += (
+                    time.perf_counter() - append_output_start
+                ) * 1000
             elif batch.is_spec_v2:
                 # Only spec v2's output_ids are updated here.
+                append_output_start = time.perf_counter()
                 req.output_ids.extend(next_token_id)
+                append_output_duration_ms += (
+                    time.perf_counter() - append_output_start
+                ) * 1000
                 new_accepted_len = len(next_token_id)
 
             # Update Mamba last track seqlen
             self._mamba_prefix_cache_update(req, batch, result, i)
 
+            check_finished_start = time.perf_counter()
             req.check_finished(new_accepted_len)
+            check_finished_duration_ms += (
+                time.perf_counter() - check_finished_start
+            ) * 1000
 
             if req.finished():
+                finished_req_count += 1
                 self.maybe_collect_routed_experts(req)
 
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                     if not self.decode_offload_manager.offload_kv_cache(req):
-                        if not self.maybe_preserve_draft_stateful_req(req):
+                        preserve_start = time.perf_counter()
+                        preserved = self._maybe_preserve_draft_req(req)
+                        preserve_duration_ms = round(
+                            (time.perf_counter() - preserve_start) * 1000, 3
+                        )
+                        preserve_draft_duration_ms += preserve_duration_ms
+                        preserve_breakdown = getattr(
+                            req, "_draft_preserve_breakdown", None
+                        )
+                        if preserve_breakdown:
+                            preserve_session_lookup_ms += float(
+                                preserve_breakdown.get("session_lookup_ms", 0.0) or 0.0
+                            )
+                            preserve_session_fetch_ms += float(
+                                preserve_breakdown.get("session_fetch_ms", 0.0) or 0.0
+                            )
+                            preserve_kv_copy_ms += float(
+                                preserve_breakdown.get("kv_copy_ms", 0.0) or 0.0
+                            )
+                            preserve_free_overallocated_ms += float(
+                                preserve_breakdown.get(
+                                    "free_overallocated_ms", 0.0
+                                )
+                                or 0.0
+                            )
+                            preserve_assert_previous_ms += float(
+                                preserve_breakdown.get("assert_previous_ms", 0.0)
+                                or 0.0
+                            )
+                            preserve_session_update_ms += float(
+                                preserve_breakdown.get("session_update_ms", 0.0)
+                                or 0.0
+                            )
+                            preserve_req_pool_free_ms += float(
+                                preserve_breakdown.get("req_pool_free_ms", 0.0) or 0.0
+                            )
+                        if preserved:
+                            preserved_draft_req_count += 1
+                        if not preserved:
+                            release_start = time.perf_counter()
                             release_kv_cache(req, self.tree_cache)
+                            release_duration_ms = round(
+                                (time.perf_counter() - release_start) * 1000, 3
+                            )
+                            release_kv_duration_ms += release_duration_ms
+                            released_req_count += 1
                 else:
-                    if not self.maybe_preserve_draft_stateful_req(req):
+                    preserve_start = time.perf_counter()
+                    preserved = self._maybe_preserve_draft_req(req)
+                    preserve_duration_ms = round(
+                        (time.perf_counter() - preserve_start) * 1000, 3
+                    )
+                    preserve_draft_duration_ms += preserve_duration_ms
+                    preserve_breakdown = getattr(req, "_draft_preserve_breakdown", None)
+                    if preserve_breakdown:
+                        preserve_session_lookup_ms += float(
+                            preserve_breakdown.get("session_lookup_ms", 0.0) or 0.0
+                        )
+                        preserve_session_fetch_ms += float(
+                            preserve_breakdown.get("session_fetch_ms", 0.0) or 0.0
+                        )
+                        preserve_kv_copy_ms += float(
+                            preserve_breakdown.get("kv_copy_ms", 0.0) or 0.0
+                        )
+                        preserve_free_overallocated_ms += float(
+                            preserve_breakdown.get("free_overallocated_ms", 0.0) or 0.0
+                        )
+                        preserve_assert_previous_ms += float(
+                            preserve_breakdown.get("assert_previous_ms", 0.0) or 0.0
+                        )
+                        preserve_session_update_ms += float(
+                            preserve_breakdown.get("session_update_ms", 0.0) or 0.0
+                        )
+                        preserve_req_pool_free_ms += float(
+                            preserve_breakdown.get("req_pool_free_ms", 0.0) or 0.0
+                        )
+                    if preserved:
+                        preserved_draft_req_count += 1
+                    if not preserved:
+                        release_start = time.perf_counter()
                         release_kv_cache(req, self.tree_cache)
+                        release_duration_ms = round(
+                            (time.perf_counter() - release_start) * 1000, 3
+                        )
+                        release_kv_duration_ms += release_duration_ms
+                        released_req_count += 1
 
                 req.time_stats.completion_time = time.perf_counter()
 
+            customized_info_start = time.perf_counter()
             self.maybe_collect_customized_info(i, req, logits_output)
+            customized_info_duration_ms += (
+                time.perf_counter() - customized_info_start
+            ) * 1000
 
             if req.return_logprob and _treat_as_normal_decode(batch.spec_algorithm):
                 # speculative worker handles logprob in speculative decoding
@@ -519,6 +678,7 @@ class SchedulerOutputProcessorMixin:
 
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
+                grammar_start = time.perf_counter()
                 try:
                     if _treat_as_normal_decode(batch.spec_algorithm):
                         # Normal decode: single token
@@ -535,9 +695,51 @@ class SchedulerOutputProcessorMixin:
                     )
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
+                grammar_duration_ms += (time.perf_counter() - grammar_start) * 1000
 
+        req_loop_duration_ms = round((time.perf_counter() - req_loop_start) * 1000, 3)
+        stream_output_start = time.perf_counter()
         self.stream_output(batch.reqs, batch.return_logprob)
+        stream_output_duration_ms = round(
+            (time.perf_counter() - stream_output_start) * 1000, 3
+        )
+        free_group_end_start = time.perf_counter()
         self.token_to_kv_pool_allocator.free_group_end()
+        free_group_end_duration_ms = round(
+            (time.perf_counter() - free_group_end_start) * 1000, 3
+        )
+        decode_output_process_duration_ms = round(
+            (time.perf_counter() - decode_output_process_start) * 1000, 3
+        )
+        batch._draft_stage_process_breakdown = {
+            "decode_batch_size": len(batch.reqs),
+            "copy_done_sync_ms": copy_done_sync_duration_ms,
+            "next_token_ids_to_list_ms": next_token_ids_to_list_duration_ms,
+            "free_group_begin_ms": free_group_begin_duration_ms,
+            "req_loop_ms": req_loop_duration_ms,
+            "append_output_ms": round(append_output_duration_ms, 3),
+            "check_finished_ms": round(check_finished_duration_ms, 3),
+            "preserve_draft_ms": round(preserve_draft_duration_ms, 3),
+            "preserve_session_lookup_ms": round(preserve_session_lookup_ms, 3),
+            "preserve_session_fetch_ms": round(preserve_session_fetch_ms, 3),
+            "preserve_kv_copy_ms": round(preserve_kv_copy_ms, 3),
+            "preserve_free_overallocated_ms": round(
+                preserve_free_overallocated_ms, 3
+            ),
+            "preserve_assert_previous_ms": round(preserve_assert_previous_ms, 3),
+            "preserve_session_update_ms": round(preserve_session_update_ms, 3),
+            "preserve_req_pool_free_ms": round(preserve_req_pool_free_ms, 3),
+            "release_kv_ms": round(release_kv_duration_ms, 3),
+            "customized_info_ms": round(customized_info_duration_ms, 3),
+            "grammar_ms": round(grammar_duration_ms, 3),
+            "stream_output_ms": stream_output_duration_ms,
+            "free_group_end_ms": free_group_end_duration_ms,
+            "finished_req_count": finished_req_count,
+            "preserved_draft_req_count": preserved_draft_req_count,
+            "released_req_count": released_req_count,
+            "total_decode_process_ms": decode_output_process_duration_ms,
+        }
+
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
         if self.current_scheduler_metrics_enabled:
@@ -905,9 +1107,12 @@ class SchedulerOutputProcessorMixin:
         skip_req: Optional[Req] = None,
         is_idle_batch: bool = False,
     ):
+        stream_generation_start = time.perf_counter()
+        payload_build_start = time.perf_counter()
         rids = []
         http_worker_ipcs = []
         finished_reasons: List[BaseFinishReason] = []
+        output_reqs: List[Req] = []
 
         decoded_texts = []
         decode_ids_list = []
@@ -1002,6 +1207,7 @@ class SchedulerOutputProcessorMixin:
                     )
 
             if should_output:
+                output_reqs.append(req)
                 send_token_offset = req.send_token_offset
                 send_output_token_logprobs_offset = (
                     req.send_output_token_logprobs_offset
@@ -1150,6 +1356,10 @@ class SchedulerOutputProcessorMixin:
         if reqs or is_idle_batch:
             if self.model_config.is_multimodal_gen:
                 return
+            payload_build_duration_ms = round(
+                (time.perf_counter() - payload_build_start) * 1000, 3
+            )
+            send_to_detokenizer_start = time.perf_counter()
             self.send_to_detokenizer.send_output(
                 BatchTokenIDOutput(
                     rids=rids,
@@ -1195,6 +1405,9 @@ class SchedulerOutputProcessorMixin:
                     retraction_counts=retraction_counts,
                     load=load,
                 )
+            )
+            send_to_detokenizer_duration_ms = round(
+                (time.perf_counter() - send_to_detokenizer_start) * 1000, 3
             )
 
     def stream_output_embedding(self: Scheduler, reqs: List[Req]):

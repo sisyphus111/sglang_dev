@@ -108,6 +108,7 @@ from sglang.srt.utils import (
     get_zmq_socket,
     kill_process_tree,
 )
+from sglang.srt.utils.csv_debug_utils import emit_csv_event
 from sglang.srt.utils.aio_rwlock import RWLock
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
@@ -123,6 +124,25 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
+
+
+def _get_int_label(labels: Dict[str, str], key: str) -> Optional[int]:
+    value = labels.get(key)
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _get_draft_debug_labels(obj) -> Optional[Dict[str, str]]:
+    labels = getattr(obj, "custom_labels", None)
+    if not isinstance(labels, dict):
+        return None
+    if labels.get("draft_trace") != "1":
+        return None
+    return labels
 
 
 @dataclasses.dataclass
@@ -493,6 +513,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         request: Optional[fastapi.Request] = None,
     ):
         created_time = obj.received_time if obj.received_time else time.time()
+        generate_start = time.perf_counter()
         self.auto_create_handle_loop()
 
         # Normalize the request
@@ -936,8 +957,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 lora_id=obj.lora_id,
                 input_embeds=input_embeds,
                 session_params=session_params,
-                draft_session_id=obj.draft_session_id,
-                draft_stateful_mode=obj.draft_stateful_mode,
                 custom_logit_processor=obj.custom_logit_processor,
                 require_reasoning=obj.require_reasoning,
                 return_hidden_states=obj.return_hidden_states,
@@ -946,6 +965,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 priority=obj.priority,
                 extra_key=obj.extra_key,
                 routing_key=obj.routing_key,
+                custom_labels=obj.custom_labels,
                 need_wait_for_image=obj.need_wait_for_image,
                 num_items_assigned=obj.num_items_assigned,
             )
@@ -1062,6 +1082,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
         created_time: Optional[float] = None,
     ):
+        labels = _get_draft_debug_labels(obj)
         trace_slice_start(RequestStage.TOKENIZER_DISPATCH, obj.rid)
         tokenized_obj.trace_context = trace_get_proc_propagate_context(obj.rid)
         tokenized_obj = wrap_shm_features(tokenized_obj)
@@ -1091,6 +1112,23 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
         self.send_to_scheduler.send_pyobj(batch_req)
+        has_draft_labels = False
+        if getattr(obj, "is_single", True):
+            has_draft_labels = _get_draft_debug_labels(obj) is not None
+        else:
+            has_draft_labels = any(
+                _get_draft_debug_labels(obj[i]) is not None
+                for i in range(len(tokenized_objs))
+            )
+        if has_draft_labels:
+            emit_csv_event(
+                "tokenizer_manager",
+                "draft_tokenizer_batch_dispatched",
+                server_role="draft",
+                batch_size=len(tokenized_objs),
+                live_req_count=len(tokenized_objs),
+                message="tokenizer manager dispatched draft batch to scheduler",
+            )
         # Create states for each individual request in the batch
         for i, tokenized_obj in enumerate(tokenized_objs):
             tmp_obj = obj[i]
@@ -1144,7 +1182,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     is_multimodal_gen=self.model_config.is_multimodal_gen,
                     request=request,
                 )
-
                 if self.request_metrics_exporter_manager.exporter_enabled():
                     # Asynchronously write metrics for this request using the exporter manager.
                     asyncio.create_task(

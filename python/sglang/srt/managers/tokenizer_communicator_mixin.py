@@ -929,9 +929,9 @@ class TokenizerCommunicatorMixin:
     ):
         await self.send_to_scheduler.send_pyobj(obj)
 
-    async def release_draft_session(self, draft_session_id: str) -> None:
+    async def release_draft_session(self, scheduler_rid: str) -> None:
         self.send_to_scheduler.send_pyobj(
-            ReleaseDraftSessionReqInput(draft_session_id=draft_session_id)
+            ReleaseDraftSessionReqInput(scheduler_rid=scheduler_rid)
         )
 
     def _update_weight_version_if_provided(self, weight_version: Optional[str]) -> None:

@@ -20,6 +20,7 @@ from run_decoupled_spec import init_demo_ray
 from run_decoupled_spec import launch_drafter_actor
 from run_decoupled_spec import launch_verifier
 from run_decoupled_spec import RAY_NAMESPACE
+from run_decoupled_spec_batch import _maybe_append_chatml_generation_prompt
 
 DEFAULT_PROMPT = """Repeat the exact string `benchmark_token` for exactly 32 lines.
 
@@ -38,7 +39,7 @@ class ModeResult:
     mode: str
     generation_time_s: float
     output_text: str
-    avg_tokens_per_round: float | None = None
+    avg_accept_length: float | None = None
     generated_tokens: int = 0
     token_throughput_tok_per_s: float = 0.0
 
@@ -81,12 +82,6 @@ def parse_args() -> argparse.Namespace:
         help="Number of speculative steps for speculative modes.",
     )
     parser.add_argument(
-        "--draft-max-capture-size",
-        type=int,
-        default=2048,
-        help="Maximum token size used by the drafter piecewise CUDA graph capture.",
-    )
-    parser.add_argument(
         "--max-model-len",
         type=int,
         default=None,
@@ -99,6 +94,12 @@ def parse_args() -> argparse.Namespace:
         help="Maximum number of generated tokens.",
     )
     parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Verifier request batch size; also caps the drafter running requests.",
+    )
+    parser.add_argument(
         "--temperature",
         type=float,
         default=0.0,
@@ -109,13 +110,23 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_PROMPT,
         help="Prompt used by both modes.",
     )
+    parser.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        help=(
+            "Enable thinking-style generation for ChatML prompts on models such "
+            "as Qwen3/Qwen3.5. Disabled by default."
+        ),
+    )
     return parser.parse_args()
 
 
 def _generate_and_measure(engine, args: argparse.Namespace) -> ModeResult:
     start_time = time.perf_counter()
     output = engine.generate(
-        prompt=args.prompt,
+        prompt=_maybe_append_chatml_generation_prompt(
+            args.prompt, enable_thinking=args.enable_thinking
+        ),
         sampling_params={
             "temperature": args.temperature,
             "max_new_tokens": args.max_new_tokens,
@@ -132,7 +143,7 @@ def _generate_and_measure(engine, args: argparse.Namespace) -> ModeResult:
         mode="",
         generation_time_s=elapsed_s,
         output_text=output.get("text", ""),
-        avg_tokens_per_round=meta_info.get("spec_accept_length"),
+        avg_accept_length=meta_info.get("spec_accept_length"),
         generated_tokens=generated_tokens,
         token_throughput_tok_per_s=token_throughput_tok_per_s,
     )
@@ -197,7 +208,7 @@ def run_decode(args: argparse.Namespace) -> ModeResult:
         engine = build_decode_engine(args)
         result = _generate_and_measure(engine, args)
         result.mode = "decode"
-        result.avg_tokens_per_round = 1
+        result.avg_accept_length = 1
         return result
     finally:
         if engine is not None:
@@ -214,7 +225,7 @@ def print_summary(results: list[ModeResult]) -> None:
             f"generation_time_s={result.generation_time_s:.3f}, "
             f"generated_tokens={result.generated_tokens}, "
             f"token_throughput={result.token_throughput_tok_per_s:.3f} tok/s, "
-            f"avg_tokens_per_round={result.avg_tokens_per_round}"
+            f"avg_accept_length={result.avg_accept_length}"
         )
 
 

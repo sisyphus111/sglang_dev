@@ -128,7 +128,7 @@ class SpeculativeAlgorithm(Enum):
             return VerifyWorker
         elif self.is_decoupled_draft():
             raise ValueError(
-                "decoupled_draft uses a dedicated scheduler entrypoint instead of create_worker()."
+                "decoupled_draft uses the normal TP worker instead of create_worker()."
             )
 
         raise ValueError("Unreachable code path in create_worker.")

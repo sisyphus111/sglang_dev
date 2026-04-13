@@ -33,7 +33,6 @@ from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUN
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.speculative.decoupled_spec_io import DraftBackendIpcConfig
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
@@ -2334,9 +2333,6 @@ class ServerArgs:
                 )
 
     def _handle_speculative_decoding(self):
-        speculative_algorithm = SpeculativeAlgorithm.from_string(
-            self.speculative_algorithm
-        )
         if (
             self.speculative_draft_model_path is not None
             and self.speculative_draft_model_revision is None
@@ -2358,23 +2354,28 @@ class ServerArgs:
                 self.speculative_moe_runner_backend
             ).is_flashinfer_trtllm(), "Currently speculative MoE runner backend cannot be flashinfer_trtllm for risk in some draft models."
 
-        if self.speculative_algorithm == "NEXTN":
-            self.speculative_algorithm = "EAGLE"
-            speculative_algorithm = SpeculativeAlgorithm.EAGLE
-
         if (
-            speculative_algorithm.is_decoupled_verify()
-            or speculative_algorithm.is_decoupled_draft()
+            self.speculative_algorithm == "DECOUPLED_VERIFY"
+            or self.speculative_algorithm == "DECOUPLED_DRAFT"
         ):
+            if self.enable_piecewise_cuda_graph:
+                logger.warning(
+                    "Piecewise CUDA graph is disabled for decoupled speculative decoding."
+                )
+                self.enable_piecewise_cuda_graph = False
+
             if self.enable_dp_attention:
                 raise ValueError(
                     "decoupled speculative decoding does not support dp attention in phase 1."
                 )
 
-            if self.max_running_requests is None:
-                self.max_running_requests = 48
+            if (
+                self.speculative_algorithm in ["DECOUPLED_VERIFY", "DECOUPLED_DRAFT"]
+                and self.max_running_requests is None
+            ):
+                self.max_running_requests = 64
                 logger.warning(
-                    "Max running requests is reset to 48 for decoupled speculative decoding. "
+                    "Max running requests is reset to 64 for decoupled verify. "
                     "You can override this by explicitly setting --max-running-requests."
                 )
 
@@ -2413,11 +2414,10 @@ class ServerArgs:
                 self.speculative_num_draft_tokens = expected_num_draft_tokens
             return
 
-        if (
-            speculative_algorithm.is_eagle()
-            or speculative_algorithm.is_standalone()
-        ):
-            if speculative_algorithm.is_standalone() and self.enable_dp_attention:
+        if self.speculative_algorithm == "NEXTN":
+            self.speculative_algorithm = "EAGLE"
+        if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
+            if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
                 # TODO: support dp attention for standalone speculative decoding
                 raise ValueError(
                     "Currently standalone speculative decoding does not support dp attention."
@@ -5711,10 +5711,7 @@ class PortArgs:
             )
 
         draft_backend_ipc_config = None
-        speculative_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
-        )
-        if speculative_algorithm.is_decoupled_verify():
+        if server_args.speculative_algorithm == "DECOUPLED_VERIFY":
             draft_backend_ipc_config = DraftBackendIpcConfig.init_new(server_args.dp_size)
 
         if not server_args.enable_dp_attention:

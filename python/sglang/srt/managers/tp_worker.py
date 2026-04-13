@@ -43,7 +43,9 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.decoupled_spec_io import extract_draft_request_id
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
+from sglang.srt.utils.csv_debug_utils import emit_csv_event, emit_summary
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -56,6 +58,87 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+
+def _summarize_seq_lens(seq_lens, *, max_count: int = 16):
+    if seq_lens is None:
+        return None
+    if isinstance(seq_lens, torch.Tensor):
+        values = seq_lens.detach().cpu().tolist()
+    else:
+        values = list(seq_lens)
+    if len(values) <= max_count:
+        return values
+    return values[:max_count] + [f"...(+{len(values) - max_count})"]
+
+
+def _parse_draft_round_id_from_rid(rid: str | None) -> int | None:
+    if not rid:
+        return None
+    request_id = extract_draft_request_id(rid)
+    if request_id is None:
+        return None
+    prefix = f"draft-{request_id}-"
+    if not rid.startswith(prefix):
+        return None
+    round_suffix = rid[len(prefix) :]
+    return int(round_suffix) if round_suffix.isdigit() else None
+
+
+def _summarize_forward_batch_reqs(reqs, *, max_count: int = 64) -> dict:
+    if not reqs:
+        return {}
+
+    batch_req_ids = []
+    batch_trace_keys = []
+    verify_request_ids = []
+    draft_round_ids = []
+    for req in reqs[:max_count]:
+        rid = getattr(req, "rid", None)
+        batch_req_ids.append(rid)
+
+        verify_request_id = None
+        draft_round_id = None
+        labels = getattr(req, "custom_labels", None)
+        if isinstance(labels, dict) and labels.get("draft_trace") == "1":
+            verify_request_id = labels.get("draft_external_rid")
+            raw_round_id = labels.get("draft_round_id")
+            if raw_round_id not in (None, ""):
+                try:
+                    draft_round_id = int(raw_round_id)
+                except (TypeError, ValueError):
+                    draft_round_id = None
+        else:
+            parsed_request_id = extract_draft_request_id(rid or "")
+            if parsed_request_id is not None:
+                verify_request_id = parsed_request_id
+                draft_round_id = _parse_draft_round_id_from_rid(rid)
+            else:
+                draft_result = getattr(req, "draft_result", None)
+                if draft_result is not None:
+                    verify_request_id = rid
+                    draft_round_id = getattr(draft_result, "draft_round_id", None)
+
+        verify_request_ids.append(verify_request_id)
+        draft_round_ids.append(draft_round_id)
+        if verify_request_id is not None and draft_round_id is not None:
+            batch_trace_keys.append(f"{verify_request_id}:{int(draft_round_id)}")
+        else:
+            batch_trace_keys.append(None)
+
+    if len(reqs) > max_count:
+        omitted = f"...(+{len(reqs) - max_count})"
+        batch_req_ids.append(omitted)
+        verify_request_ids.append(omitted)
+        draft_round_ids.append(omitted)
+        batch_trace_keys.append(omitted)
+
+    return {
+        "batch_req_ids": batch_req_ids,
+        "batch_trace_keys": batch_trace_keys,
+        "verify_request_ids": verify_request_ids,
+        "draft_round_ids": draft_round_ids,
+    }
 
 
 class BaseTpWorker(ABC):
@@ -461,6 +544,44 @@ class TpModelWorker(BaseTpWorker):
                 skip_attn_backend_init=skip_attn_backend_init,
             )
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
+            forward_duration_ms = (time.perf_counter() - forward_start) * 1000
+            req_trace_fields = _summarize_forward_batch_reqs(
+                getattr(model_worker_batch, "reqs", None)
+            )
+            emit_csv_event(
+                "tp_worker",
+                "tp_worker_forward_batch_finished",
+                server_role="verify" if is_verify else "draft",
+                batch_size=len(forward_batch.seq_lens) if forward_batch.seq_lens is not None else None,
+                live_req_count=len(forward_batch.seq_lens) if forward_batch.seq_lens is not None else None,
+                duration_ms=round(forward_duration_ms, 3),
+                message="tp worker finished forward batch generation",
+                is_verify=bool(is_verify),
+                can_run_cuda_graph=bool(can_run_cuda_graph),
+                seq_lens_sum=forward_batch.seq_lens_sum,
+                forward_mode=(
+                    str(forward_batch.forward_mode)
+                    if getattr(forward_batch, "forward_mode", None) is not None
+                    else None
+                ),
+                seq_lens_head=_summarize_seq_lens(forward_batch.seq_lens),
+                extend_num_tokens=getattr(forward_batch, "extend_num_tokens", None),
+                num_tokens=getattr(forward_batch.input_ids, "shape", [None])[0]
+                if getattr(forward_batch, "input_ids", None) is not None
+                else None,
+                **req_trace_fields,
+            )
+            if self._is_summary_leader_rank():
+                emit_summary(
+                    logger,
+                    key=f"tp_worker.forward.{self.tp_rank}.{self.pp_group.is_last_rank}.{is_verify}",
+                    component="tp_worker",
+                    event="tp_worker_forward_summary",
+                    message="tp worker forward batch finished",
+                    server_role="verify" if is_verify else "draft",
+                    batch_size=len(forward_batch.seq_lens) if forward_batch.seq_lens is not None else None,
+                    duration_ms=round(forward_duration_ms, 3),
+                )
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
                 can_run_cuda_graph=can_run_cuda_graph,
@@ -538,6 +659,9 @@ class TpModelWorker(BaseTpWorker):
     def _is_entry_rank(self) -> bool:
         return self.pp_rank == 0 and self.tp_rank == 0 and self.attn_cp_rank == 0
 
+    def _is_summary_leader_rank(self) -> bool:
+        return self.pp_group.is_last_rank and self.tp_rank == 0 and self.attn_cp_rank == 0
+
     def _measure_forward_time_ms(self, forward_start: float) -> float:
         if str(self.device).startswith("cuda"):
             torch.cuda.synchronize()
@@ -560,22 +684,14 @@ class TpModelWorker(BaseTpWorker):
         if not is_decode and not is_extend:
             return
 
-        mode = "decode" if is_decode else "prefill"
-        graph_backend = "cuda_graph" if is_decode else "piecewise_cuda_graph"
-        has_graph_runner = self.model_runner.graph_runner is not None
-        has_piecewise_graph_runner = (
-            self.model_runner.piecewise_cuda_graph_runner is not None
-        )
+        # mode = "decode" if is_decode else "prefill"
+        # has_graph_runner = self.model_runner.graph_runner is not None
         # print(
         #     "[decoupled-draft-worker] "
         #     f"mode={mode} "
-        #     f"graph_backend={graph_backend} "
-        #     f"graph_hit={bool(can_run_cuda_graph)} "
+        #     f"cuda_graph={bool(can_run_cuda_graph)} "
         #     f"has_cuda_graph_runner={has_graph_runner} "
-        #     f"has_piecewise_cuda_graph_runner={has_piecewise_graph_runner} "
-        #     f"disable_cuda_graph={bool(self.model_runner.server_args.disable_cuda_graph)} "
-        #     f"enable_piecewise_cuda_graph={bool(self.model_runner.server_args.enable_piecewise_cuda_graph)} "
-        #     f"forward_time_ms={forward_time_ms:.3f} "
+        #     f"forward_ms={forward_time_ms:.3f} "
         #     f"batch_size={forward_batch.batch_size} "
         #     f"seq_lens_sum={int(forward_batch.seq_lens.sum().item()) if forward_batch.seq_lens is not None else 0}",
         #     flush=True,

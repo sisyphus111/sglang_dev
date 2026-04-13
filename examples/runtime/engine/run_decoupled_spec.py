@@ -23,6 +23,8 @@ import sglang as sgl
 import torch
 from sglang.srt.speculative.decoupled_spec_io import DraftRequest, DraftResult
 
+from run_decoupled_spec_batch import _maybe_append_chatml_generation_prompt
+
 ACTOR_NAME = "sglang-decoupled-drafter"
 RAY_NAMESPACE = "sglang-decoupled-spec"
 DEFAULT_PROMPT = """Solve this simple math problem using C++17 and return only one complete code block.
@@ -54,7 +56,7 @@ class DemoRayRuntime:
             "address": self.address,
             "namespace": self.namespace,
             "ignore_reinit_error": True,
-            "log_to_driver": False,
+            "log_to_driver": True,
             "logging_level": "ERROR",
         }
 
@@ -104,16 +106,16 @@ def parse_args() -> argparse.Namespace:
         help="Number of speculative steps for decoupled speculation.",
     )
     parser.add_argument(
-        "--draft-max-capture-size",
-        type=int,
-        default=2048,
-        help="Maximum token size used by the drafter piecewise CUDA graph capture.",
-    )
-    parser.add_argument(
         "--max-new-tokens",
         type=int,
         default=64,
         help="Maximum number of tokens to generate from the verifier.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Verifier request batch size; also caps the drafter running requests.",
     )
     parser.add_argument(
         "--temperature",
@@ -125,6 +127,14 @@ def parse_args() -> argparse.Namespace:
         "--prompt",
         default=DEFAULT_PROMPT,
         help="Prompt used for the end-to-end verifier generation request.",
+    )
+    parser.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        help=(
+            "Enable thinking-style generation for ChatML prompts on models such "
+            "as Qwen3/Qwen3.5. Disabled by default."
+        ),
     )
     return parser.parse_args()
 
@@ -170,7 +180,7 @@ def init_demo_ray(namespace: str) -> DemoRayRuntime:
                 address=address,
                 namespace=namespace,
                 ignore_reinit_error=True,
-                log_to_driver=False,
+                log_to_driver=True,
                 logging_level="ERROR",
             )
             return DemoRayRuntime(
@@ -204,32 +214,34 @@ class DraftEngineActor:
         gpu_ids: list[str],
         tp_size: int,
         speculative_num_steps: int,
-        draft_max_capture_size: int,
     ):
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_ids)
         self.drafter = sgl.Engine(
             model_path=model_path,
             tp_size=tp_size,
-            speculative_algorithm="decoupled_draft",
+            speculative_algorithm="DECOUPLED_DRAFT",
             speculative_num_steps=speculative_num_steps,
             speculative_num_draft_tokens=speculative_num_steps + 1,
             disable_radix_cache=True,
             chunked_prefill_size=-1,
-            enable_piecewise_cuda_graph=True,
-            piecewise_cuda_graph_max_tokens=draft_max_capture_size,
         )
 
     def ready(self) -> bool:
         return True
 
-    def handle_draft_request(self, request: DraftRequest) -> DraftResult:
-        return self.drafter.handle_draft_request(request)
+    async def handle_draft_request(self, request: DraftRequest) -> DraftResult:
+        return await self.drafter.handle_draft_request(request)
 
-    def terminate_draft_request(self, request_id: str):
-        self.drafter.terminate_draft_request(request_id)
+    async def handle_draft_requests(
+        self, requests: list[DraftRequest]
+    ) -> list[DraftResult]:
+        return await self.drafter.handle_draft_requests(requests)
 
-    def release_draft_session(self, request_id: str):
-        self.drafter.release_draft_session(request_id)
+    async def terminate_draft_request(self, request_id: str):
+        await self.drafter.terminate_draft_request(request_id)
+
+    async def release_draft_session(self, request_id: str):
+        await self.drafter.release_draft_session(request_id)
 
     def shutdown(self) -> None:
         self.drafter.shutdown()
@@ -264,16 +276,32 @@ def allocate_demo_gpus(args: argparse.Namespace) -> tuple[list[str], list[str]]:
     return draft_gpu_ids, target_gpu_ids
 
 
+def _get_drafter_debug_env_vars() -> dict[str, str]:
+    env_vars = {}
+    for key in (
+        "DECOUPLED_SPEC_DEBUG_CSV_DIR",
+        "DECOUPLED_SPEC_DEBUG_SUMMARY_INTERVAL_SEC",
+    ):
+        value = os.environ.get(key)
+        if value:
+            env_vars[key] = value
+    return env_vars
+
+
 def launch_drafter_actor(args: argparse.Namespace) -> tuple[ray.actor.ActorHandle, str]:
-    actor = DraftEngineActor.options(
+    actor_options = dict(
         name=ACTOR_NAME,
         num_gpus=args.draft_tp_size,
-    ).remote(
+        max_concurrency=128,
+    )
+    debug_env_vars = _get_drafter_debug_env_vars()
+    if debug_env_vars:
+        actor_options["runtime_env"] = {"env_vars": debug_env_vars}
+    actor = DraftEngineActor.options(**actor_options).remote(
         model_path=args.draft_model_path,
         gpu_ids=args.draft_gpu_ids,
         tp_size=args.draft_tp_size,
         speculative_num_steps=args.num_speculative_steps,
-        draft_max_capture_size=args.draft_max_capture_size,
     )
     ray.get(actor.ready.remote())
     return actor, ACTOR_NAME
@@ -291,7 +319,7 @@ def launch_verifier(
     return sgl.Engine(
         model_path=target_model_path,
         tp_size=target_tp_size,
-        speculative_algorithm="decoupled_verify",
+        speculative_algorithm="DECOUPLED_VERIFY",
         speculative_num_steps=speculative_num_steps,
         speculative_num_draft_tokens=speculative_num_draft_tokens,
         draft_actor_names=[draft_actor_name],
@@ -315,14 +343,17 @@ def run_end_to_end_generation(
 
     text = output.get("text", "")
     meta_info = output.get("meta_info", {})
-    avg_tokens_per_round = meta_info.get("spec_accept_length")
+    avg_accept_length = meta_info.get("spec_accept_length")
     print(f"output_text: {text[:100]}...")
     print(f"generation_time_s: {elapsed_s:.3f}")
-    print(f"avg_tokens_per_round: {avg_tokens_per_round}")
+    print(f"avg_accept_length: {avg_accept_length}")
 
 
 def main() -> None:
     args = parse_args()
+    args.prompt = _maybe_append_chatml_generation_prompt(
+        args.prompt, enable_thinking=args.enable_thinking
+    )
     drafter_actor = None
     verifier = None
     ray_runtime = None

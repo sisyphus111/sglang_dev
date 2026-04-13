@@ -545,8 +545,7 @@ class Req(ReqDllmMixin):
         routing_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
-        draft_session_id: Optional[str] = None,
-        draft_stateful_mode: bool = False,
+        custom_labels: Optional[dict[str, str]] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -562,13 +561,7 @@ class Req(ReqDllmMixin):
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
         self.fill_ids = []
         self.session_id = session_id
-        self.draft_session_id = draft_session_id
-        self.draft_stateful_mode = draft_stateful_mode
         self.input_embeds = input_embeds
-        self._draft_actual_delta = None
-        self._draft_can_use_decode_fast_path = False
-        self._draft_decode_fast_path_input_id = None
-        self._draft_decode_fast_path_base_seq_len = None
 
         # For req-level memory management
         self.kv_committed_len = 0
@@ -592,6 +585,7 @@ class Req(ReqDllmMixin):
 
         # For multi-http worker
         self.http_worker_ipc = http_worker_ipc
+        self.custom_labels = custom_labels
 
         # Require reasoning for the request (hybrid reasoning model only)
         self.require_reasoning = require_reasoning
@@ -894,26 +888,6 @@ class Req(ReqDllmMixin):
         return self.finished_reason is not None
 
     def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
-        manual_prefix_state = getattr(self, "_draft_manual_prefix_state", None)
-        if manual_prefix_state is not None:
-            assert (
-                tree_cache is not None
-            ), "draft manual prefix state requires a valid tree_cache"
-            self.fill_ids = list(manual_prefix_state["fill_ids"])
-            self.prefix_indices = manual_prefix_state["prefix_indices"]
-            root_node = getattr(tree_cache, "root_node", None)
-            self.last_node = root_node
-            self.last_host_node = root_node
-            self.host_hit_length = 0
-            self.mamba_branching_seqlen = None
-            if self.draft_stateful_mode:
-                self.cache_protected_len = 0
-            else:
-                self.cache_protected_len = len(self.prefix_indices)
-            self.set_extend_input_len(len(self.fill_ids) - len(self.prefix_indices))
-            delattr(self, "_draft_manual_prefix_state")
-            return
-
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
             self.determine_dllm_phase()
@@ -932,7 +906,7 @@ class Req(ReqDllmMixin):
             match_result = tree_cache.match_prefix(
                 MatchPrefixParams(
                     key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
-                    req=self if tree_cache.supports_mamba() else None,
+                    req=self,
                     cow_mamba=tree_cache.supports_mamba(),
                 )
             )
@@ -1245,7 +1219,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # the check of whether to prefill new requests.
     # This is an optimization to reduce the overhead of the prefill check.
     batch_is_full: bool = False
-    draft_decode_fast_path_pending_merge: bool = False
 
     # For chunked prefill in PP
     chunked_req: Optional[Req] = None
@@ -2066,28 +2039,28 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 device=self.device,
             )
 
-    def prepare_for_draft_decode_fast_path(self):
+    def prepare_for_draft_decode_fast_path_pending(self):
         self.forward_mode = ForwardMode.DECODE
-        self.draft_decode_fast_path_pending_merge = True
 
         decode_input_ids = []
         base_seq_lens = []
         req_pool_indices = []
 
         for req in self.reqs:
-            input_token_id = getattr(req, "_draft_decode_fast_path_input_id", None)
-            base_seq_len = getattr(req, "_draft_decode_fast_path_base_seq_len", None)
             if (
-                not getattr(req, "_draft_can_use_decode_fast_path", False)
-                or input_token_id is None
-                or base_seq_len is None
+                not getattr(req, "draft_stateful_mode", False)
                 or req.req_pool_idx is None
+                or req.kv_committed_freed
+                or req.kv_committed_len <= 0
+                or len(req.fill_ids) != req.kv_committed_len + 1
             ):
                 raise ValueError(
                     "Draft decode fast path requires a preserved stateful req "
                     f"with req_pool_idx and external committed token, got {req.rid=}"
                 )
 
+            input_token_id = req.fill_ids[-1]
+            base_seq_len = req.kv_committed_len
             decode_input_ids.append(int(input_token_id))
             base_seq_lens.append(int(base_seq_len))
             req_pool_indices.append(int(req.req_pool_idx))
@@ -2105,18 +2078,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.orig_seq_lens = torch.tensor(
             base_seq_lens, dtype=torch.int32, device=self.device
         )
+        self.multimodal_inputs = [req.multimodal_inputs for req in self.reqs]
         self.seq_lens_sum = sum(base_seq_lens)
         self.extend_num_tokens = 0
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
             self,
             self.model_config.vocab_size,
         )
-        self.prepare_for_decode()
-
-        for req in self.reqs:
-            req._draft_can_use_decode_fast_path = False
-            req._draft_decode_fast_path_input_id = None
-            req._draft_decode_fast_path_base_seq_len = None
 
     def maybe_wait_verify_done(self):
         if self.is_spec_v2:
@@ -2352,7 +2320,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_seqlens=self.mamba_track_seqlens,
             dp_cooperation_info=self.dp_cooperation_info,
             prefill_stats=self.prefill_stats,
-            draft_decode_fast_path_pending_merge=self.draft_decode_fast_path_pending_merge,
         )
 
     def maybe_evict_swa(self):
