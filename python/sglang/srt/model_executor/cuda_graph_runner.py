@@ -276,7 +276,12 @@ class CudaGraphRunner:
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
-        if model_runner.spec_algorithm.uses_target_verify_graph_capture():
+        if (
+            model_runner.spec_algorithm.is_eagle()
+            or model_runner.spec_algorithm.is_standalone()
+            or model_runner.spec_algorithm.is_ngram()
+            or model_runner.spec_algorithm.is_decoupled_verify()
+        ):
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen")
             else:
@@ -382,7 +387,9 @@ class CudaGraphRunner:
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
-                if self.model_runner.spec_algorithm.uses_target_verify_graph_capture()
+                if self.model_runner.spec_algorithm.is_eagle()
+                or self.model_runner.spec_algorithm.is_standalone()
+                or self.model_runner.spec_algorithm.is_decoupled_verify()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
@@ -436,35 +443,13 @@ class CudaGraphRunner:
             else True
         )
 
-        can_run = (
+        return (
             is_bs_supported
             and is_encoder_lens_supported
             and is_tbo_supported
             and capture_hidden_mode_matches
             and is_ngram_supported
         )
-        # if forward_batch.forward_mode.is_target_verify():
-        #     print(
-        #         "[cuda-graph-diagnose] "
-        #         f"tp_rank={get_tensor_model_parallel_rank()} "
-        #         f"can_run={can_run} "
-        #         f"graph_key={graph_key} "
-        #         f"cuda_graph_bs={cuda_graph_bs} "
-        #         f"batch_size={forward_batch.batch_size} "
-        #         f"num_tokens_per_bs={self.num_tokens_per_bs} "
-        #         f"is_bs_supported={is_bs_supported} "
-        #         f"is_encoder_lens_supported={is_encoder_lens_supported} "
-        #         f"capture_hidden_mode_matches={capture_hidden_mode_matches} "
-        #         f"requested_capture_hidden_mode={requested_capture_hidden_mode} "
-        #         f"capture_hidden_mode={self.capture_hidden_mode} "
-        #         f"is_tbo_supported={is_tbo_supported} "
-        #         f"is_ngram_supported={is_ngram_supported} "
-        #         f"require_mlp_sync={self.require_mlp_sync} "
-        #         f"can_run_dp_cuda_graph={getattr(forward_batch, 'can_run_dp_cuda_graph', None)} "
-        #         f"disable_padding={self.disable_padding}",
-        #         flush=True,
-        #     )
-        return can_run
 
     def _init_profile_context_and_memory_record(self):
         profile_context = profile(
@@ -806,7 +791,9 @@ class CudaGraphRunner:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
             max_batch_size = (
                 max_num_tokens / self.num_tokens_per_bs
-                if self.model_runner.spec_algorithm.uses_target_verify_graph_capture()
+                if self.model_runner.spec_algorithm.is_eagle()
+                or self.model_runner.spec_algorithm.is_standalone()
+                or self.model_runner.spec_algorithm.is_decoupled_verify()
                 else max_num_tokens
             )
             index = bisect.bisect_left(self.capture_bs, max_batch_size)
@@ -906,7 +893,11 @@ class CudaGraphRunner:
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None
-        if self.model_runner.spec_algorithm.uses_target_verify_graph_capture():
+        if (
+            self.model_runner.spec_algorithm.is_eagle()
+            or self.model_runner.spec_algorithm.is_standalone()
+            or self.model_runner.spec_algorithm.is_decoupled_verify()
+        ):
             from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
             if self.model_runner.is_draft_worker:

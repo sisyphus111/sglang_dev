@@ -588,6 +588,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
                     mamba_ping_pong_track_buffer_to_free[idx_to_free]
                 )
             self.mamba_pool.free(mamba_ping_pong_track_buffer_to_free)
+            req.mamba_ping_pong_track_buffer = None
+            req.mamba_next_track_idx = None
 
     def clear(self):
         logger.info("Reset HybridReqToTokenPool")

@@ -606,7 +606,11 @@ class CPUGraphRunner:
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None
-        if self.model_runner.spec_algorithm.uses_target_verify_graph_capture():
+        if (
+            self.model_runner.spec_algorithm.is_eagle()
+            or self.model_runner.spec_algorithm.is_standalone()
+            or self.model_runner.spec_algorithm.is_decoupled_verify()
+        ):
             from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
             if self.model_runner.is_draft_worker:

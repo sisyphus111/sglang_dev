@@ -363,7 +363,11 @@ class SchedulerMetricsMixin:
             )
 
         iter_msg = f" [{self.forward_ct}]" if LOG_FORWARD_ITERS else ""
-        msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
+        msg = (
+            f"Decode batch{iter_msg}, "
+            f"#running-req: {num_running_reqs}, "
+            f"{token_usage_msg}"
+        )
 
         if self.spec_algorithm.is_none() or self.spec_algorithm.is_decoupled_draft():
             spec_accept_length = 0

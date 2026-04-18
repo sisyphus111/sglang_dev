@@ -25,18 +25,41 @@ import ray
 import sglang as sgl
 from ray.util.placement_group import placement_group, remove_placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-from sglang.srt.speculative.decoupled_spec_io import DraftRequest, DraftResult
 
 from run_decoupled_spec_batch import (
     DEFAULT_PROMPT_COLUMN_CANDIDATES,
+    _build_dapo_math_17k_prompt,
     _build_chat_template_renderer,
+    _get_real_verify_acceptance_stats,
+    _messages_to_fallback_text,
     _normalize_prompt,
     infer_prompt_column,
+    resolve_dapo_math_17k_prompt_column,
 )
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_RAY_NAMESPACE = "sglang-decoupled-spec-bench"
+CODEFORCES_REQUIRED_COLUMNS = [
+    "description",
+    "input_format",
+    "output_format",
+    "time_limit",
+    "memory_limit",
+]
+CODEFORCES_OPTIONAL_COLUMNS = [
+    "title",
+    "note",
+    "examples",
+    "input_mode",
+    "interaction_format",
+]
+CODEFORCES_LANGUAGE_ALIASES = {
+    "python": "Python 3",
+    "py": "Python 3",
+    "cpp": "C++17",
+    "c++": "C++17",
+}
 
 
 @dataclass
@@ -54,6 +77,7 @@ class ModeMetrics:
     output_throughput_tok_per_s: float
     per_request: list[dict[str, Any]]
     avg_spec_accept_length: float | None = None
+    avg_spec_accept_rate: float | None = None
 
 
 def _sort_gpu_ids(gpu_ids: list[Any]) -> list[str]:
@@ -116,6 +140,28 @@ def parse_args() -> argparse.Namespace:
             f"searched in order: {DEFAULT_PROMPT_COLUMN_CANDIDATES}."
         ),
     )
+    parser.add_argument(
+        "--dataset-format",
+        choices=["auto", "codeforces_raw", "dapo_math_17k"],
+        default="auto",
+        help=(
+            "How to interpret the parquet rows. "
+            "'auto' reads one prompt-like column. "
+            "'codeforces_raw' builds a prompt from Codeforces problem fields and, "
+            "when enabled, renders it through the model tokenizer's chat template. "
+            "'dapo_math_17k' reads the DAPO-Math-17k structured prompt messages "
+            "and renders them through the target model chat template."
+        ),
+    )
+    parser.add_argument(
+        "--code-language",
+        choices=["python", "py", "cpp", "c++"],
+        default="python",
+        help=(
+            "Target language used when --dataset-format=codeforces_raw. "
+            "Ignored for normal prompt-column datasets."
+        ),
+    )
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument(
         "--batch-size",
@@ -169,6 +215,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--draft-tp-size", type=int, default=1)
     parser.add_argument("--num-speculative-steps", type=int, default=3)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help=(
+            "Enable deterministic inference for both decoupled drafter and "
+            "verifier engines."
+        ),
+    )
     parser.add_argument(
         "--ignore-eos",
         action="store_true",
@@ -228,6 +282,131 @@ def _count_prompt_tokens(tokenizer, prompt: str) -> int:
     return len(tokenizer.encode(prompt))
 
 
+def _stringify_optional_text(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    return text
+
+
+def _format_codeforces_examples(examples: Any) -> str:
+    if not isinstance(examples, list):
+        return ""
+
+    blocks: list[str] = []
+    for index, example in enumerate(examples, start=1):
+        if not isinstance(example, dict):
+            continue
+        input_text = _stringify_optional_text(example.get("input"))
+        output_text = _stringify_optional_text(example.get("output"))
+        if not input_text and not output_text:
+            continue
+
+        parts = [f"Example {index}"]
+        if input_text:
+            parts.append("Input:")
+            parts.append(input_text)
+        if output_text:
+            parts.append("Output:")
+            parts.append(output_text)
+        blocks.append("\n".join(parts))
+
+    return "\n\n".join(blocks)
+
+
+def _build_codeforces_raw_prompt(
+    row: dict[str, Any],
+    *,
+    row_index: int,
+    chat_template_renderer,
+    code_language: str,
+    enable_thinking: bool,
+) -> str:
+    missing_values = [
+        column
+        for column in CODEFORCES_REQUIRED_COLUMNS
+        if not _stringify_optional_text(row.get(column))
+    ]
+    if missing_values:
+        raise ValueError(
+            f"Row {row_index} is missing required Codeforces fields: {missing_values}"
+        )
+
+    normalized_language = CODEFORCES_LANGUAGE_ALIASES.get(
+        code_language.lower(), code_language
+    )
+    title = _stringify_optional_text(row.get("title"))
+    description = _stringify_optional_text(row.get("description"))
+    input_format = _stringify_optional_text(row.get("input_format"))
+    output_format = _stringify_optional_text(row.get("output_format"))
+    note = _stringify_optional_text(row.get("note"))
+    input_mode = _stringify_optional_text(row.get("input_mode"))
+    interaction_format = _stringify_optional_text(row.get("interaction_format"))
+    examples_text = _format_codeforces_examples(row.get("examples"))
+
+    limit_parts = [
+        f"Time limit: {_stringify_optional_text(row.get('time_limit'))} seconds",
+        f"Memory limit: {_stringify_optional_text(row.get('memory_limit'))} MB",
+    ]
+    if input_mode:
+        if input_mode == "stdio":
+            limit_parts.append(
+                "I/O mode: standard input and standard output"
+            )
+        else:
+            limit_parts.append(f"I/O mode: {input_mode}")
+
+    user_sections = [
+        (
+            f"Write a correct and efficient {normalized_language} solution for the "
+            "following competitive programming problem."
+        ),
+        "\n".join(limit_parts),
+    ]
+    if title:
+        user_sections.append(f"Title: {title}")
+    user_sections.extend(
+        [
+            "Problem description:",
+            description,
+            "Input format:",
+            input_format,
+            "Output format:",
+            output_format,
+        ]
+    )
+    if interaction_format:
+        user_sections.extend(["Interaction format:", interaction_format])
+    if note:
+        user_sections.extend(["Notes:", note])
+    if examples_text:
+        user_sections.extend(["Examples:", examples_text])
+    user_sections.append(
+        (
+            f"Return only the final {normalized_language} source code. "
+            "Do not include explanations or Markdown fences."
+        )
+    )
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an expert competitive programmer. Produce a correct, "
+                "efficient solution that respects the stated constraints."
+            ),
+        },
+        {
+            "role": "user",
+            "content": "\n\n".join(section for section in user_sections if section),
+        },
+    ]
+
+    if chat_template_renderer is not None:
+        return chat_template_renderer(messages)
+    return _messages_to_fallback_text(messages)
+
+
 def load_prompt_samples(args: argparse.Namespace) -> tuple[str, list[PromptSample], int]:
     try:
         import pyarrow.parquet as pq
@@ -256,11 +435,39 @@ def load_prompt_samples(args: argparse.Namespace) -> tuple[str, list[PromptSampl
         )
 
     column_names = parquet_file.schema_arrow.names
-    prompt_column = args.prompt_column or infer_prompt_column(column_names)
-    if prompt_column not in column_names:
-        raise ValueError(
-            f"prompt column {prompt_column!r} not found. Available columns: {column_names}"
+    if args.dataset_format == "codeforces_raw":
+        missing_columns = [
+            column
+            for column in CODEFORCES_REQUIRED_COLUMNS
+            if column not in column_names
+        ]
+        if missing_columns:
+            raise ValueError(
+                "dataset-format=codeforces_raw requires Codeforces problem fields. "
+                f"Missing columns: {missing_columns}. Available columns: {column_names}"
+            )
+        prompt_column = f"codeforces_raw[{CODEFORCES_LANGUAGE_ALIASES.get(args.code_language.lower(), args.code_language)}]"
+        read_columns = [
+            column
+            for column in [*CODEFORCES_REQUIRED_COLUMNS, *CODEFORCES_OPTIONAL_COLUMNS]
+            if column in column_names
+        ]
+        selected_prompt_column = None
+    elif args.dataset_format == "dapo_math_17k":
+        selected_prompt_column = resolve_dapo_math_17k_prompt_column(
+            column_names,
+            prompt_column=args.prompt_column,
         )
+        prompt_column = f"dapo_math_17k[{selected_prompt_column}]"
+        read_columns = [selected_prompt_column]
+    else:
+        selected_prompt_column = args.prompt_column or infer_prompt_column(column_names)
+        if selected_prompt_column not in column_names:
+            raise ValueError(
+                f"prompt column {selected_prompt_column!r} not found. Available columns: {column_names}"
+            )
+        prompt_column = selected_prompt_column
+        read_columns = [selected_prompt_column]
 
     tokenizer_path = args.tokenizer_path or args.target_model_path
     tokenizer = _build_tokenizer(tokenizer_path)
@@ -280,25 +487,46 @@ def load_prompt_samples(args: argparse.Namespace) -> tuple[str, list[PromptSampl
 
     for record_batch in parquet_file.iter_batches(
         batch_size=reader_batch_size,
-        columns=[prompt_column],
+        columns=read_columns,
     ):
-        column_values = record_batch.column(0).to_pylist()
-        if remaining_skip >= len(column_values):
-            remaining_skip -= len(column_values)
-            current_row += len(column_values)
+        if args.dataset_format in {"codeforces_raw", "dapo_math_17k"}:
+            batch_rows = record_batch.to_pylist()
+        else:
+            batch_rows = record_batch.column(0).to_pylist()
+
+        if remaining_skip >= len(batch_rows):
+            remaining_skip -= len(batch_rows)
+            current_row += len(batch_rows)
             continue
 
         start_index = remaining_skip
-        for local_index in range(start_index, len(column_values)):
+        for local_index in range(start_index, len(batch_rows)):
             row_index = current_row + local_index
             try:
-                prompt = _normalize_prompt(
-                    column_values[local_index],
-                    row_index,
-                    prompt_column,
-                    chat_template_renderer,
-                    enable_thinking=args.enable_thinking,
-                )
+                if args.dataset_format == "codeforces_raw":
+                    prompt = _build_codeforces_raw_prompt(
+                        batch_rows[local_index],
+                        row_index=row_index,
+                        chat_template_renderer=chat_template_renderer,
+                        code_language=args.code_language,
+                        enable_thinking=args.enable_thinking,
+                    )
+                elif args.dataset_format == "dapo_math_17k":
+                    prompt = _build_dapo_math_17k_prompt(
+                        batch_rows[local_index],
+                        row_index=row_index,
+                        prompt_column=selected_prompt_column or "prompt",
+                        chat_template_renderer=chat_template_renderer,
+                        enable_thinking=args.enable_thinking,
+                    )
+                else:
+                    prompt = _normalize_prompt(
+                        batch_rows[local_index],
+                        row_index,
+                        prompt_column,
+                        chat_template_renderer,
+                        enable_thinking=args.enable_thinking,
+                    )
             except Exception:
                 skipped_invalid += 1
                 continue
@@ -329,7 +557,7 @@ def load_prompt_samples(args: argparse.Namespace) -> tuple[str, list[PromptSampl
             if len(samples) >= args.batch_size:
                 return prompt_column, samples, total_rows
 
-        current_row += len(column_values)
+        current_row += len(batch_rows)
         remaining_skip = 0
 
     raise ValueError(
@@ -453,6 +681,34 @@ def derive_dist_init_addr_from_pg(
     return f"{host}:{port}"
 
 
+def derive_result_endpoint_from_pg(
+    args: argparse.Namespace,
+    pg,
+    avoid_port: int | None = None,
+) -> str:
+    scheduling_strategy = PlacementGroupSchedulingStrategy(
+        placement_group=pg,
+        placement_group_bundle_index=0,
+    )
+    for _ in range(16):
+        actor = DistInitBootstrapActor.options(
+            num_cpus=0,
+            scheduling_strategy=scheduling_strategy,
+        ).remote()
+        try:
+            reservation = ray.get(actor.reserve_port.remote(None))
+            host = reservation["host"]
+            port = int(reservation["port"])
+            ray.get(actor.release_port.remote())
+        finally:
+            ray.kill(actor, no_restart=True)
+
+        if avoid_port is None or port != avoid_port:
+            return f"tcp://{host}:{port}"
+
+    raise RuntimeError("failed to reserve a result endpoint port")
+
+
 def init_ray(address: str, namespace: str, nnodes: int) -> None:
     init_kwargs = dict(
         address=address,
@@ -499,6 +755,10 @@ def validate_resources(args: argparse.Namespace) -> tuple[int, int]:
         raise ValueError("draft-tp-size must be positive")
     if args.num_draft_replicas <= 0:
         raise ValueError("num-draft-replicas must be positive")
+    if args.num_draft_replicas != 1:
+        raise ValueError(
+            "This ZMQ mesh demo currently supports exactly one draft replica."
+        )
 
     target_nnodes, target_gpus_per_node = derive_target_layout(args)
 
@@ -545,15 +805,18 @@ def validate_resources(args: argparse.Namespace) -> tuple[int, int]:
     return target_nnodes, target_gpus_per_node
 
 
-def _get_drafter_debug_env_vars() -> dict[str, str]:
-    env_vars = {}
-    for key in (
-        "DECOUPLED_SPEC_DEBUG_CSV_DIR",
-        "DECOUPLED_SPEC_DEBUG_SUMMARY_INTERVAL_SEC",
+def _get_drafter_debug_env_vars(
+    args: argparse.Namespace | None = None,
+) -> dict[str, str]:
+    env_vars: dict[str, str] = {}
+    for env_name in (
+        "SGLANG_DECOUPLED_SPEC_DEBUG",
+        "SGLANG_DECOUPLED_SPEC_TRACE_DIR",
+        "SGLANG_DECOUPLED_SPEC_SUMMARY_INTERVAL",
     ):
-        value = os.environ.get(key)
-        if value:
-            env_vars[key] = value
+        env_value = os.environ.get(env_name)
+        if env_value:
+            env_vars[env_name] = env_value
     return env_vars
 
 
@@ -565,37 +828,33 @@ class DraftEngineActor:
         model_path: str,
         tp_size: int,
         speculative_num_steps: int,
+        result_endpoint: str,
+        deterministic: bool = False,
     ):
         self.assigned_gpu_ids = _pin_actor_to_assigned_gpus(tp_size)
+        port, reserved_socket = _reserve_tcp_port()
+        control_endpoint = f"tcp://{ray.util.get_node_ip_address()}:{port}"
+        reserved_socket.close()
+        self.control_endpoint = control_endpoint
         engine_kwargs: dict[str, Any] = dict(
             model_path=model_path,
             tp_size=tp_size,
             speculative_algorithm="DECOUPLED_DRAFT",
             speculative_num_steps=speculative_num_steps,
             speculative_num_draft_tokens=speculative_num_steps + 1,
+            decoupled_spec_control_endpoints=[control_endpoint],
+            decoupled_spec_result_endpoints=[result_endpoint],
             disable_radix_cache=True,
             chunked_prefill_size=-1,
+            enable_deterministic_inference=deterministic,
         )
         self.engine = sgl.Engine(**engine_kwargs)
 
-    def ready(self) -> bool:
+    def ready(self) -> dict[str, Any]:
         return {
             "assigned_gpu_ids": self.assigned_gpu_ids,
+            "control_endpoint": self.control_endpoint,
         }
-
-    async def handle_draft_request(self, request: DraftRequest) -> DraftResult:
-        return await self.engine.handle_draft_request(request)
-
-    async def handle_draft_requests(
-        self, requests: list[DraftRequest]
-    ) -> list[DraftResult]:
-        return await self.engine.handle_draft_requests(requests)
-
-    async def terminate_draft_request(self, request_id: str):
-        await self.engine.terminate_draft_request(request_id)
-
-    async def release_draft_session(self, request_id: str):
-        await self.engine.release_draft_session(request_id)
 
     def shutdown(self) -> bool:
         self.engine.shutdown()
@@ -615,9 +874,9 @@ class TargetEngineActor:
         dist_init_addr: str | None,
         batch_size: int,
         speculative_num_steps: int | None = None,
-        draft_actor_names: list[str] | None = None,
-        draft_actor_namespace: str | None = None,
-        ray_init_kwargs: dict[str, Any] | None = None,
+        control_endpoints: list[str] | None = None,
+        result_endpoints: list[str] | None = None,
+        deterministic: bool = False,
     ):
         self.mode = mode
         self.node_rank = node_rank
@@ -634,17 +893,15 @@ class TargetEngineActor:
             node_rank=node_rank,
             dist_init_addr=dist_init_addr,
             max_running_requests=batch_size,
+            enable_deterministic_inference=deterministic,
         )
         if mode == "decoupled_spec":
             engine_kwargs.update(
                 speculative_algorithm="DECOUPLED_VERIFY",
                 speculative_num_steps=speculative_num_steps,
                 speculative_num_draft_tokens=speculative_num_steps + 1,
-                draft_actor_names=draft_actor_names,
-                draft_actor_namespace=draft_actor_namespace,
-                draft_backend_process_kwargs={
-                    "ray_init_kwargs": dict(ray_init_kwargs or {})
-                },
+                decoupled_spec_control_endpoints=control_endpoints,
+                decoupled_spec_result_endpoints=result_endpoints,
             )
         elif mode != "decode":
             raise ValueError(f"Unsupported mode: {mode}")
@@ -681,10 +938,11 @@ class TargetEngineActor:
 def launch_draft_actors(
     args: argparse.Namespace,
     actor_prefix: str,
+    result_endpoint: str,
 ) -> tuple[list[Any], list[str]]:
     actors = []
-    actor_names = []
-    debug_env_vars = _get_drafter_debug_env_vars()
+    control_endpoints = []
+    debug_env_vars = _get_drafter_debug_env_vars(args)
     for replica_index in range(args.num_draft_replicas):
         actor_name = f"{actor_prefix}-draft-{replica_index}"
         actor_options: dict[str, Any] = dict(
@@ -699,11 +957,13 @@ def launch_draft_actors(
             model_path=args.draft_model_path,
             tp_size=args.draft_tp_size,
             speculative_num_steps=args.num_speculative_steps,
+            result_endpoint=result_endpoint,
+            deterministic=args.deterministic,
         )
         actors.append(actor)
-        actor_names.append(actor_name)
-    ray.get([actor.ready.remote() for actor in actors])
-    return actors, actor_names
+    ready_infos = ray.get([actor.ready.remote() for actor in actors])
+    control_endpoints.extend(info["control_endpoint"] for info in ready_infos)
+    return actors, control_endpoints
 
 
 def create_target_placement_group(target_nnodes: int, target_gpus_per_node: int):
@@ -725,17 +985,10 @@ def launch_target_actors(
     target_nnodes: int,
     target_gpus_per_node: int,
     pg,
-    draft_actor_names: list[str] | None = None,
+    control_endpoints: list[str] | None = None,
+    result_endpoints: list[str] | None = None,
 ) -> list[Any]:
-
-    ray_init_kwargs = {
-        "address": args.ray_address,
-        "namespace": args.ray_namespace,
-        "ignore_reinit_error": True,
-        "log_to_driver": False,
-        "logging_level": logging.ERROR,
-    }
-    debug_env_vars = _get_drafter_debug_env_vars()
+    debug_env_vars = _get_drafter_debug_env_vars(args)
     actors = []
     for node_rank in range(target_nnodes):
         scheduling_strategy = PlacementGroupSchedulingStrategy(
@@ -758,9 +1011,9 @@ def launch_target_actors(
             dist_init_addr=dist_init_addr,
             batch_size=args.batch_size,
             speculative_num_steps=args.num_speculative_steps,
-            draft_actor_names=draft_actor_names,
-            draft_actor_namespace=args.ray_namespace,
-            ray_init_kwargs=ray_init_kwargs,
+            control_endpoints=control_endpoints,
+            result_endpoints=result_endpoints,
+            deterministic=args.deterministic,
         )
         actors.append(actor)
 
@@ -783,6 +1036,86 @@ def shutdown_actors(actors: list[Any]) -> None:
                 pass
 
 
+def collect_mode_metrics(
+    *,
+    mode: str,
+    elapsed_s: float,
+    outputs: list[dict[str, Any]],
+    prompt_samples: list[PromptSample],
+) -> ModeMetrics:
+    if len(outputs) != len(prompt_samples):
+        raise RuntimeError(
+            f"{mode} returned {len(outputs)} outputs for {len(prompt_samples)} prompts"
+        )
+
+    total_generated_tokens = 0
+    total_accepted_tokens = 0
+    total_draft_tokens = 0
+    total_verify_ct = 0
+    per_request = []
+    for index, (sample, output) in enumerate(zip(prompt_samples, outputs, strict=True)):
+        output_ids = output.get("output_ids", [])
+        generated_tokens = len(output_ids) if isinstance(output_ids, list) else 0
+        total_generated_tokens += generated_tokens
+
+        meta_info = output.get("meta_info", {}) or {}
+        (
+            accept_length,
+            accept_rate,
+            accepted_tokens,
+            draft_tokens,
+            verify_ct,
+        ) = _get_real_verify_acceptance_stats(meta_info)
+        total_accepted_tokens += accepted_tokens
+        total_draft_tokens += draft_tokens
+        total_verify_ct += verify_ct
+        output_text = output.get("text", "")
+        finish_reason = meta_info.get("finish_reason")
+
+        per_request.append(
+            {
+                "batch_index": index,
+                "row_index": sample.row_index,
+                "prompt_tokens": sample.prompt_tokens,
+                "generated_tokens": generated_tokens,
+                "spec_accept_length": accept_length,
+                "spec_accept_rate": accept_rate,
+                "spec_accept_token_num": accepted_tokens or None,
+                "spec_draft_token_num": draft_tokens or None,
+                "spec_verify_ct": verify_ct or None,
+                "finish_reason": finish_reason,
+                "output_text_preview": (
+                    output_text[:512] if isinstance(output_text, str) else None
+                ),
+                "output_ids_head": output_ids[:32]
+                if isinstance(output_ids, list)
+                else None,
+                "output_ids_tail": output_ids[-32:]
+                if isinstance(output_ids, list)
+                else None,
+            }
+        )
+
+    throughput = total_generated_tokens / elapsed_s if elapsed_s > 0 else 0.0
+    avg_accept_length = (
+        total_accepted_tokens / total_verify_ct
+        if total_verify_ct > 0
+        else None
+    )
+    avg_accept_rate = (
+        total_accepted_tokens / total_draft_tokens if total_draft_tokens > 0 else None
+    )
+    return ModeMetrics(
+        mode=mode,
+        generation_time_s=elapsed_s,
+        total_generated_tokens=total_generated_tokens,
+        output_throughput_tok_per_s=throughput,
+        per_request=per_request,
+        avg_spec_accept_length=avg_accept_length,
+        avg_spec_accept_rate=avg_accept_rate,
+    )
+
+
 def run_mode(
     *,
     args: argparse.Namespace,
@@ -794,7 +1127,8 @@ def run_mode(
     target_nnodes: int,
     target_gpus_per_node: int,
     pg=None,
-    draft_actor_names: list[str] | None = None,
+    control_endpoints: list[str] | None = None,
+    result_endpoints: list[str] | None = None,
 ) -> ModeMetrics:
     target_actors: list[Any] = []
     owns_pg = pg is None
@@ -808,7 +1142,8 @@ def run_mode(
             target_nnodes=target_nnodes,
             target_gpus_per_node=target_gpus_per_node,
             pg=pg,
-            draft_actor_names=draft_actor_names,
+            control_endpoints=control_endpoints,
+            result_endpoints=result_endpoints,
         )
         result = ray.get(
             target_actors[0].generate_and_measure.remote(prompts, sampling_params)
@@ -825,7 +1160,9 @@ def run_mode(
         )
 
     total_generated_tokens = 0
-    accept_lengths = []
+    total_accepted_tokens = 0
+    total_draft_tokens = 0
+    total_verify_ct = 0
     per_request = []
     for index, (sample, output) in enumerate(zip(prompt_samples, outputs, strict=True)):
         output_ids = output.get("output_ids", [])
@@ -833,9 +1170,18 @@ def run_mode(
         total_generated_tokens += generated_tokens
 
         meta_info = output.get("meta_info", {}) or {}
-        accept_length = meta_info.get("spec_accept_length")
-        if accept_length is not None:
-            accept_lengths.append(float(accept_length))
+        (
+            accept_length,
+            accept_rate,
+            accepted_tokens,
+            draft_tokens,
+            verify_ct,
+        ) = _get_real_verify_acceptance_stats(meta_info)
+        total_accepted_tokens += accepted_tokens
+        total_draft_tokens += draft_tokens
+        total_verify_ct += verify_ct
+        output_text = output.get("text", "")
+        finish_reason = meta_info.get("finish_reason")
 
         per_request.append(
             {
@@ -844,13 +1190,32 @@ def run_mode(
                 "prompt_tokens": sample.prompt_tokens,
                 "generated_tokens": generated_tokens,
                 "spec_accept_length": accept_length,
+                "spec_accept_rate": accept_rate,
+                "spec_accept_token_num": accepted_tokens or None,
+                "spec_draft_token_num": draft_tokens or None,
+                "spec_verify_ct": verify_ct or None,
+                "finish_reason": finish_reason,
+                "output_text_preview": (
+                    output_text[:512] if isinstance(output_text, str) else None
+                ),
+                "output_ids_head": output_ids[:32]
+                if isinstance(output_ids, list)
+                else None,
+                "output_ids_tail": output_ids[-32:]
+                if isinstance(output_ids, list)
+                else None,
             }
         )
 
     elapsed_s = float(result["elapsed_s"])
     throughput = total_generated_tokens / elapsed_s if elapsed_s > 0 else 0.0
     avg_accept_length = (
-        sum(accept_lengths) / len(accept_lengths) if accept_lengths else None
+        total_accepted_tokens / total_verify_ct
+        if total_verify_ct > 0
+        else None
+    )
+    avg_accept_rate = (
+        total_accepted_tokens / total_draft_tokens if total_draft_tokens > 0 else None
     )
     return ModeMetrics(
         mode=mode,
@@ -859,6 +1224,7 @@ def run_mode(
         output_throughput_tok_per_s=throughput,
         per_request=per_request,
         avg_spec_accept_length=avg_accept_length,
+        avg_spec_accept_rate=avg_accept_rate,
     )
 
 
@@ -881,7 +1247,9 @@ def build_result(
     return {
         "config": {
             "dataset_path": args.dataset_path,
+            "dataset_format": args.dataset_format,
             "prompt_column": prompt_column,
+            "code_language": args.code_language,
             "offset": args.offset,
             "batch_size": args.batch_size,
             "context_length": args.context_length,
@@ -894,6 +1262,7 @@ def build_result(
             "draft_tp_size": args.draft_tp_size,
             "num_speculative_steps": args.num_speculative_steps,
             "temperature": args.temperature,
+            "deterministic": args.deterministic,
             "ignore_eos": args.ignore_eos,
             "nnodes": args.nnodes,
             "n_gpu_per_node": args.n_gpu_per_node,
@@ -905,6 +1274,15 @@ def build_result(
             "total_rows": total_rows,
             "loaded_rows": [sample.row_index for sample in prompt_samples],
             "total_prompt_tokens": sum(sample.prompt_tokens for sample in prompt_samples),
+            "prompt_samples": [
+                {
+                    "row_index": sample.row_index,
+                    "prompt_tokens": sample.prompt_tokens,
+                    "prompt_head": sample.prompt[:1024],
+                    "prompt_tail": sample.prompt[-1024:],
+                }
+                for sample in prompt_samples
+            ],
         },
         "decoupled_spec": asdict(spec_metrics),
         "decode": asdict(decode_metrics),
@@ -918,6 +1296,7 @@ def print_summary(result: dict[str, Any]) -> None:
     speedup = result["e2e_speedup"]
     print("=== decoupled_spec_vs_decode_batch ===")
     print(f"dataset_path: {result['config']['dataset_path']}")
+    print(f"dataset_format: {result['config']['dataset_format']}")
     print(f"prompt_column: {result['config']['prompt_column']}")
     print(f"batch_size: {result['config']['batch_size']}")
     print(f"max_new_tokens: {result['config']['max_new_tokens']}")
@@ -927,7 +1306,8 @@ def print_summary(result: dict[str, Any]) -> None:
         f"generation_time_s={spec['generation_time_s']:.3f}, "
         f"generated_tokens={spec['total_generated_tokens']}, "
         f"output_throughput={spec['output_throughput_tok_per_s']:.3f} tok/s, "
-        f"avg_spec_accept_length={spec['avg_spec_accept_length']}"
+        f"avg_spec_accept_length={spec['avg_spec_accept_length']}, "
+        f"avg_spec_accept_rate={spec['avg_spec_accept_rate']}"
     )
     print(
         "decode: "
@@ -944,7 +1324,9 @@ def print_summary(result: dict[str, Any]) -> None:
             f"row_index={item['row_index']}, "
             f"prompt_tokens={item['prompt_tokens']}, "
             f"generated_tokens={item['generated_tokens']}, "
-            f"spec_accept_length={item['spec_accept_length']}"
+            f"spec_accept_length={item['spec_accept_length']}, "
+            f"spec_accept_rate={item['spec_accept_rate']}, "
+            f"spec_verify_ct={item['spec_verify_ct']}"
         )
 
 
@@ -968,7 +1350,17 @@ def main() -> None:
 
         spec_pg = create_target_placement_group(target_nnodes, target_gpus_per_node)
         spec_dist_init_addr = derive_dist_init_addr_from_pg(args, spec_pg)
-        draft_actors, draft_actor_names = launch_draft_actors(args, actor_prefix)
+        _, spec_dist_init_port = _parse_host_port(spec_dist_init_addr)
+        result_endpoint = derive_result_endpoint_from_pg(
+            args,
+            spec_pg,
+            avoid_port=spec_dist_init_port,
+        )
+        draft_actors, control_endpoints = launch_draft_actors(
+            args,
+            actor_prefix,
+            result_endpoint,
+        )
         spec_metrics = run_mode(
             args=args,
             mode="decoupled_spec",
@@ -979,7 +1371,8 @@ def main() -> None:
             target_nnodes=target_nnodes,
             target_gpus_per_node=target_gpus_per_node,
             pg=spec_pg,
-            draft_actor_names=draft_actor_names,
+            control_endpoints=control_endpoints,
+            result_endpoints=[result_endpoint],
         )
         shutdown_actors(draft_actors)
         draft_actors = []

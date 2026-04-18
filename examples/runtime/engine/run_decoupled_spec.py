@@ -3,7 +3,7 @@ End-to-end decoupled speculative decoding demo.
 
 This script:
 1. Launches a `decoupled_draft` SGLang engine inside a Ray actor.
-2. Launches a `decoupled_verify` SGLang engine that talks to the drafter actor.
+2. Launches a `decoupled_verify` SGLang engine connected to the drafter over ZMQ.
 3. Runs one end-to-end generation request through the verifier.
 4. Prints generation latency, final text, and average acceptance rate.
 """
@@ -21,9 +21,12 @@ from dataclasses import dataclass
 import ray
 import sglang as sgl
 import torch
-from sglang.srt.speculative.decoupled_spec_io import DraftRequest, DraftResult
+from sglang.srt.speculative.decoupled_spec_io import DraftMeshIpcConfig
 
-from run_decoupled_spec_batch import _maybe_append_chatml_generation_prompt
+from run_decoupled_spec_batch import (
+    _get_real_verify_acceptance_stats,
+    _maybe_append_chatml_generation_prompt,
+)
 
 ACTOR_NAME = "sglang-decoupled-drafter"
 RAY_NAMESPACE = "sglang-decoupled-spec"
@@ -214,6 +217,8 @@ class DraftEngineActor:
         gpu_ids: list[str],
         tp_size: int,
         speculative_num_steps: int,
+        control_endpoints: list[str],
+        result_endpoints: list[str],
     ):
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_ids)
         self.drafter = sgl.Engine(
@@ -222,26 +227,14 @@ class DraftEngineActor:
             speculative_algorithm="DECOUPLED_DRAFT",
             speculative_num_steps=speculative_num_steps,
             speculative_num_draft_tokens=speculative_num_steps + 1,
+            decoupled_spec_control_endpoints=control_endpoints,
+            decoupled_spec_result_endpoints=result_endpoints,
             disable_radix_cache=True,
             chunked_prefill_size=-1,
         )
 
     def ready(self) -> bool:
         return True
-
-    async def handle_draft_request(self, request: DraftRequest) -> DraftResult:
-        return await self.drafter.handle_draft_request(request)
-
-    async def handle_draft_requests(
-        self, requests: list[DraftRequest]
-    ) -> list[DraftResult]:
-        return await self.drafter.handle_draft_requests(requests)
-
-    async def terminate_draft_request(self, request_id: str):
-        await self.drafter.terminate_draft_request(request_id)
-
-    async def release_draft_session(self, request_id: str):
-        await self.drafter.release_draft_session(request_id)
 
     def shutdown(self) -> None:
         self.drafter.shutdown()
@@ -277,18 +270,36 @@ def allocate_demo_gpus(args: argparse.Namespace) -> tuple[list[str], list[str]]:
 
 
 def _get_drafter_debug_env_vars() -> dict[str, str]:
-    env_vars = {}
-    for key in (
-        "DECOUPLED_SPEC_DEBUG_CSV_DIR",
-        "DECOUPLED_SPEC_DEBUG_SUMMARY_INTERVAL_SEC",
+    env_vars: dict[str, str] = {}
+    for env_name in (
+        "SGLANG_DECOUPLED_SPEC_DEBUG",
+        "SGLANG_DECOUPLED_SPEC_TRACE_DIR",
+        "SGLANG_DECOUPLED_SPEC_SUMMARY_INTERVAL",
     ):
-        value = os.environ.get(key)
-        if value:
-            env_vars[key] = value
+        env_value = os.environ.get(env_name)
+        if env_value:
+            env_vars[env_name] = env_value
     return env_vars
 
 
-def launch_drafter_actor(args: argparse.Namespace) -> tuple[ray.actor.ActorHandle, str]:
+def _endpoint_lists(ipc_config: DraftMeshIpcConfig) -> tuple[list[str], list[str]]:
+    return (
+        [
+            ipc_config.control_endpoints[rank]
+            for rank in sorted(ipc_config.control_endpoints)
+        ],
+        [
+            ipc_config.result_endpoints[rank]
+            for rank in sorted(ipc_config.result_endpoints)
+        ],
+    )
+
+
+def launch_drafter_actor(
+    args: argparse.Namespace,
+    control_endpoints: list[str],
+    result_endpoints: list[str],
+) -> ray.actor.ActorHandle:
     actor_options = dict(
         name=ACTOR_NAME,
         num_gpus=args.draft_tp_size,
@@ -302,19 +313,20 @@ def launch_drafter_actor(args: argparse.Namespace) -> tuple[ray.actor.ActorHandl
         gpu_ids=args.draft_gpu_ids,
         tp_size=args.draft_tp_size,
         speculative_num_steps=args.num_speculative_steps,
+        control_endpoints=control_endpoints,
+        result_endpoints=result_endpoints,
     )
     ray.get(actor.ready.remote())
-    return actor, ACTOR_NAME
+    return actor
 
 
 def launch_verifier(
     target_model_path: str,
-    draft_actor_name: str,
-    draft_actor_namespace: str,
     target_tp_size: int,
     speculative_num_steps: int,
     speculative_num_draft_tokens: int,
-    draft_backend_process_kwargs: dict[str, object] | None = None,
+    control_endpoints: list[str],
+    result_endpoints: list[str],
 ) -> sgl.Engine:
     return sgl.Engine(
         model_path=target_model_path,
@@ -322,9 +334,8 @@ def launch_verifier(
         speculative_algorithm="DECOUPLED_VERIFY",
         speculative_num_steps=speculative_num_steps,
         speculative_num_draft_tokens=speculative_num_draft_tokens,
-        draft_actor_names=[draft_actor_name],
-        draft_actor_namespace=draft_actor_namespace,
-        draft_backend_process_kwargs=draft_backend_process_kwargs,
+        decoupled_spec_control_endpoints=control_endpoints,
+        decoupled_spec_result_endpoints=result_endpoints,
     )
 
 
@@ -343,10 +354,13 @@ def run_end_to_end_generation(
 
     text = output.get("text", "")
     meta_info = output.get("meta_info", {})
-    avg_accept_length = meta_info.get("spec_accept_length")
+    avg_accept_length, avg_accept_rate, *_ = _get_real_verify_acceptance_stats(
+        meta_info
+    )
     print(f"output_text: {text[:100]}...")
     print(f"generation_time_s: {elapsed_s:.3f}")
     print(f"avg_accept_length: {avg_accept_length}")
+    print(f"avg_accept_rate: {avg_accept_rate}")
 
 
 def main() -> None:
@@ -361,19 +375,23 @@ def main() -> None:
     try:
         draft_gpu_ids, target_gpu_ids = allocate_demo_gpus(args)
         args.draft_gpu_ids = draft_gpu_ids
+        control_endpoints, result_endpoints = _endpoint_lists(
+            DraftMeshIpcConfig.init_new(1)
+        )
         ray_runtime = init_demo_ray(RAY_NAMESPACE)
-        drafter_actor, drafter_actor_name = launch_drafter_actor(args)
+        drafter_actor = launch_drafter_actor(
+            args,
+            control_endpoints,
+            result_endpoints,
+        )
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(target_gpu_ids)
         verifier = launch_verifier(
             args.target_model_path,
-            drafter_actor_name,
-            RAY_NAMESPACE,
             args.target_tp_size,
             args.num_speculative_steps,
             args.num_speculative_steps + 1,
-            draft_backend_process_kwargs={
-                "ray_init_kwargs": ray_runtime.build_init_kwargs()
-            },
+            control_endpoints,
+            result_endpoints,
         )
         run_end_to_end_generation(verifier, args)
     finally:

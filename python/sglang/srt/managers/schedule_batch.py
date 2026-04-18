@@ -42,6 +42,7 @@ import dataclasses
 import logging
 import re
 import time
+from collections import deque
 from enum import Enum, auto
 from functools import lru_cache
 from http import HTTPStatus
@@ -85,6 +86,10 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, get_global_server_args
+from sglang.srt.speculative.decoupled_spec_io import (
+    DraftReqKey,
+    VerifyCommit,
+)
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 
@@ -560,6 +565,14 @@ class Req(ReqDllmMixin):
         self.output_ids = []
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
         self.fill_ids = []
+        # Decoupled drafter control state：
+        # (src_verifier_rank, rid), used to identify a draft request
+        self.draft_key: Optional[DraftReqKey] = None
+        # length of the prefix that is committed by the verifier——used to determine the validity/staleness of draft tokens
+        self.verifier_committed_prefix_len: int = 0
+        # verify results received from the verifier, need to be applied to the draft request(e.g. overwrite the bonus token_id)
+        self.draft_pending_verify_commits: deque[VerifyCommit] = deque()
+
         self.session_id = session_id
         self.input_embeds = input_embeds
 
@@ -906,7 +919,7 @@ class Req(ReqDllmMixin):
             match_result = tree_cache.match_prefix(
                 MatchPrefixParams(
                     key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
-                    req=self,
+                    req=self if tree_cache.supports_mamba() else None,
                     cow_mamba=tree_cache.supports_mamba(),
                 )
             )
@@ -1850,11 +1863,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self, server_args: ServerArgs
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
-        if any(getattr(req, "draft_stateful_mode", False) for req in self.reqs):
-            raise AssertionError(
-                "drafter stateful no-radix mode does not support retract_decode; "
-                "please lower concurrency or memory usage"
-            )
+
+        # for debug & performance benchmark, no retract is allowed
+        assert False, "some requests are to be retracted"
+
         sorted_indices = list(range(len(self.reqs)))
 
         # TODO(lsyin): improve retraction policy for radix cache
@@ -2038,53 +2050,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 dtype=torch.bool,
                 device=self.device,
             )
-
-    def prepare_for_draft_decode_fast_path_pending(self):
-        self.forward_mode = ForwardMode.DECODE
-
-        decode_input_ids = []
-        base_seq_lens = []
-        req_pool_indices = []
-
-        for req in self.reqs:
-            if (
-                not getattr(req, "draft_stateful_mode", False)
-                or req.req_pool_idx is None
-                or req.kv_committed_freed
-                or req.kv_committed_len <= 0
-                or len(req.fill_ids) != req.kv_committed_len + 1
-            ):
-                raise ValueError(
-                    "Draft decode fast path requires a preserved stateful req "
-                    f"with req_pool_idx and external committed token, got {req.rid=}"
-                )
-
-            input_token_id = req.fill_ids[-1]
-            base_seq_len = req.kv_committed_len
-            decode_input_ids.append(int(input_token_id))
-            base_seq_lens.append(int(base_seq_len))
-            req_pool_indices.append(int(req.req_pool_idx))
-
-        self.output_ids = torch.tensor(
-            decode_input_ids, dtype=torch.int64, device=self.device
-        )
-        self.req_pool_indices = torch.tensor(
-            req_pool_indices, dtype=torch.int32, device=self.device
-        )
-        self.seq_lens = torch.tensor(
-            base_seq_lens, dtype=torch.int64, device=self.device
-        )
-        self.seq_lens_cpu = torch.tensor(base_seq_lens, dtype=torch.int64)
-        self.orig_seq_lens = torch.tensor(
-            base_seq_lens, dtype=torch.int32, device=self.device
-        )
-        self.multimodal_inputs = [req.multimodal_inputs for req in self.reqs]
-        self.seq_lens_sum = sum(base_seq_lens)
-        self.extend_num_tokens = 0
-        self.sampling_info = SamplingBatchInfo.from_schedule_batch(
-            self,
-            self.model_config.vocab_size,
-        )
 
     def maybe_wait_verify_done(self):
         if self.is_spec_v2:

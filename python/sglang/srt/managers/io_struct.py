@@ -1649,11 +1649,6 @@ class CloseSessionReqInput(BaseReq):
 
 
 @dataclass
-class ReleaseDraftSessionReqInput(BaseReq):
-    scheduler_rid: str
-
-
-@dataclass
 class OpenSessionReqOutput(BaseReq):
     session_id: Optional[str]
     success: bool

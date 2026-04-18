@@ -22,9 +22,19 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.speculative.decoupled_spec_io import (
+    DraftClose,
+    DraftControlMessage,
+    DraftReqKey,
+    DraftSync,
+    DraftTailStreamOutput,
+    VerifyCommit,
+    build_draft_scheduler_rid,
+)
 from sglang.srt.tracing.trace import trace_slice, trace_slice_batch, trace_slice_end
-from sglang.srt.utils.csv_debug_utils import emit_csv_event
+from sglang.srt.utils import broadcast_pyobj
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -39,43 +49,533 @@ logger = logging.getLogger(__name__)
 DEFAULT_FORCE_STREAM_INTERVAL = 50
 
 
-def _get_draft_trace_labels(req: Req) -> Optional[dict]:
-    labels = getattr(req, "custom_labels", None)
-    if not isinstance(labels, dict) or labels.get("draft_trace") != "1":
-        return None
-    return labels
-
-
-def _draft_int_label(labels: dict, key: str) -> Optional[int]:
-    value = labels.get(key)
-    if value in (None, ""):
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _safe_len(value) -> int:
-    return 0 if value is None else len(value)
-
-
-def _treat_as_normal_decode(spec_algorithm) -> bool:
-    return spec_algorithm.is_none() or spec_algorithm.is_decoupled_draft()
-
-
 class SchedulerOutputProcessorMixin:
     """
     This class implements the output processing logic for Scheduler.
     We put them into a separate file to make the `scheduler.py` shorter.
     """
 
-    def _maybe_preserve_draft_req(self: Scheduler, req: Req) -> bool:
-        finished_reason = getattr(req, "finished_reason", None)
-        if getattr(finished_reason, "is_error", False):
-            return False
-        preserve = getattr(self.tree_cache, "maybe_preserve_req", None)
-        return bool(preserve is not None and preserve(req))
+    def _is_decoupled_draft_entry_rank(self: Scheduler) -> bool:
+        return (
+            self.spec_algorithm.is_decoupled_draft()
+            and self.pp_rank == 0
+            and self.attn_tp_rank == 0
+            and self.attn_cp_rank == 0
+        )
+
+    def _broadcast_draft_control_messages(
+        self: Scheduler,
+        messages: list[DraftControlMessage] | None,
+    ) -> list[DraftControlMessage]:
+        """
+        Broadcast draft control messages among all ranks:
+        DraftSync: build a new draft request based on its prompt token_ids
+        VerifyCommit: overwrite the bonus token and truncate the suffix if needed
+        """
+        if getattr(self.server_args, "enable_dp_attention", False):
+            if self.attn_tp_size != 1:
+                messages = broadcast_pyobj(
+                    messages,
+                    self.attn_tp_group.rank,
+                    self.attn_tp_cpu_group,
+                    src=self.attn_tp_group.ranks[0],
+                )
+            if self.attn_cp_size != 1:
+                messages = broadcast_pyobj(
+                    messages,
+                    self.attn_cp_group.rank,
+                    self.attn_cp_cpu_group,
+                    src=self.attn_cp_group.ranks[0],
+                )
+            return list(messages or [])
+
+        if self.tp_size != 1:
+            messages = broadcast_pyobj(
+                messages,
+                self.tp_group.rank,
+                self.tp_cpu_group,
+                src=self.tp_group.ranks[0],
+            )
+        return list(messages or [])
+
+    def _get_draft_adapter_thread(self: Scheduler):
+        adapter = self.draft_adapter_thread
+        if adapter is None:
+            raise RuntimeError("Decoupled draft entry rank has no draft adapter thread")
+        return adapter
+
+    def _submit_draft_tokens_stream(
+        self: Scheduler,
+        stream_outputs: list[DraftTailStreamOutput],
+    ) -> None:
+        """
+        Submit new draft tokens produced by a decode round to the verifier.
+        """
+        if not stream_outputs:
+            return
+        if not self._is_decoupled_draft_entry_rank():
+            stream_outputs.clear()
+            return
+        self._get_draft_adapter_thread().submit_draft_results(stream_outputs)
+        stream_outputs.clear()
+
+
+    def _draft_apply_verify_commit(
+        self: Scheduler,
+        req: Req,
+        message: VerifyCommit,
+        *,
+        batch: Optional[ScheduleBatch] = None,
+        req_batch_idx: Optional[int] = None,
+    ) -> None:
+        """
+        apply the verify result (pre_verify_committed_len, bonus_token_pos,
+        bonus_token_id) to the draft request:
+        1. overwrite the bonus token, update the related states, including output_ids, grammar, kv cache, stream output... if needed
+        2. update the req's verifier_committed_prefix_len to (bonus_token_pos + 1)
+        """
+        pre_verify_committed_len = int(message.pre_verify_committed_len)
+        bonus_token_pos = int(message.bonus_token_pos)
+        bonus_token_id = int(message.bonus_token_id)
+
+
+        assert (
+            pre_verify_committed_len <= req.verifier_committed_prefix_len
+            and bonus_token_pos >= pre_verify_committed_len
+        ), f"drafter must push forward verifier_committed_prefix_len based on previous committed prefix, but got pre_verify_committed_len > verifier_committed_prefix_len: {pre_verify_committed_len} > {req.verifier_committed_prefix_len}"
+
+        assert bonus_token_pos + 1 >= req.verifier_committed_prefix_len, "VerifyCommit must arrive in order"
+
+        if bonus_token_pos > len(req.output_ids):
+            if req.draft_key is not None:
+                request_id = req.draft_key.request_id
+            else:
+                request_id = req.rid
+            raise RuntimeError(
+                "Decoupled draft received a verify commit beyond its decoded tail: "
+                f"request_id={request_id} "
+                f"bonus_token_pos={bonus_token_pos} "
+                f"output_len={len(req.output_ids)} "
+                f"committed_prefix_len={req.verifier_committed_prefix_len}"
+            )
+
+
+        bonus_token_matches = (
+            bonus_token_pos < len(req.output_ids)
+            and req.output_ids[bonus_token_pos] == bonus_token_id
+        )
+
+        if bonus_token_matches:
+            # if the bonus token matches, only need to push forward the req's verifier_committed_prefix_len
+            req.verifier_committed_prefix_len = bonus_token_pos + 1
+            return
+
+        # The verifier-selected bonus token replaces the drafter suffix starting at
+        # `bonus_token_pos`.
+        #
+        # Positions here are in req.output_ids, not in the full prompt+output
+        # sequence. The kept output range is [0, truncate_from), and the removed
+        # output range is [truncate_from, len(req.output_ids)). In other words,
+        # `truncate_from` itself is removed. After the removal, `bonus_token_id`
+        # is appended at exactly that position.
+        truncate_from = max(0, min(bonus_token_pos, len(req.output_ids)))
+
+        # Number of output tokens removed from the drafter suffix:
+        # len(req.output_ids[truncate_from:]).
+        removed = len(req.output_ids) - truncate_from
+
+        # KV positions are in the full sequence coordinate system:
+        # [0, prompt_len) are prompt tokens, and output_ids[i] corresponds to
+        # full-sequence position prompt_len + i. Therefore the KV entries to
+        # discard start at `kv_truncate_from`, inclusive.
+        prompt_len = len(req.origin_input_ids)
+        kv_truncate_from = prompt_len + truncate_from
+
+        if removed > 0:
+            if req.grammar is not None:
+                try:
+                    req.grammar.rollback(removed)
+                except Exception:
+                    logger.debug("Draft grammar rollback failed for req %s", req.rid)
+
+            if req.req_pool_idx is not None and not req.kv_committed_freed:
+                # Only free KV slots that are currently allocated for this req.
+                # `trimmed_end` is exclusive. The freed full-sequence KV range is
+                # [kv_truncate_from, trimmed_end). If kv_truncate_from ==
+                # trimmed_end, there is nothing to free.
+                trimmed_end = min(
+                    req.kv_allocated_len, prompt_len + len(req.output_ids)
+                )
+                if kv_truncate_from < trimmed_end:
+                    indices_to_free = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, kv_truncate_from:trimmed_end
+                    ]
+                    if len(indices_to_free) > 0:
+                        self.token_to_kv_pool_allocator.free(indices_to_free)
+                req.kv_committed_len = min(req.kv_committed_len, kv_truncate_from)
+                req.kv_allocated_len = min(req.kv_allocated_len, kv_truncate_from)
+                req.cache_protected_len = min(
+                    req.cache_protected_len, kv_truncate_from
+                )
+
+            # Truncate per-output arrays with the same output-index interval:
+            # delete [truncate_from, old_output_len).
+            del req.output_ids[truncate_from:]
+            if req.return_logprob:
+                del req.output_token_logprobs_val[truncate_from:]
+                del req.output_token_logprobs_idx[truncate_from:]
+                del req.output_top_logprobs_val[truncate_from:]
+                del req.output_top_logprobs_idx[truncate_from:]
+                del req.output_token_ids_logprobs_val[truncate_from:]
+                del req.output_token_ids_logprobs_idx[truncate_from:]
+            if req.hidden_states:
+                del req.hidden_states[truncate_from:]
+
+        req.output_ids.append(bonus_token_id)
+        if req.grammar is not None:
+            try:
+                req.grammar.accept_token(bonus_token_id)
+            except Exception:
+                logger.debug(
+                    "Draft grammar accept failed during bonus token update for req %s",
+                    req.rid,
+                )
+        req.finished_reason = None
+        req.finished_len = None
+        req.finished_output = None
+        req.to_finish = None
+        req.decoded_text = ""
+
+        req.verifier_committed_prefix_len = bonus_token_pos + 1
+
+        if batch is not None and req_batch_idx is not None:
+            # Keep the in-flight decode batch consistent with the rewritten request
+            # state. This block is only needed when the verifier bonus token changed
+            # req.output_ids above: either an existing suffix was truncated and
+            # replaced, or the bonus token was appended at the current tail.
+            #
+            # Decode seq_len is the number of tokens **already present in KV** before the
+            # next tail token is consumed. For a drafter request, output_ids[-1] is the
+            # current tail token used as the next decode input, so the KV-backed prefix
+            # is origin_input_ids plus output_ids[0:-1]. The slice [0, -1) excludes the
+            # tail token itself, hence len(origin_input_ids) + max(len(output_ids)-1, 0).
+            new_seq_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+
+            # batch.output_ids[req_batch_idx] stores the single tail token that the
+            # decode worker will consume next. Prefer the last output token. If no
+            # output token exists yet, fall back to the last prompt token. In both
+            # cases the selected token is included as the decode input, but excluded
+            # from new_seq_len above.
+            if req.output_ids:
+                new_tail_token_id = int(req.output_ids[-1])
+            elif req.origin_input_ids:
+                new_tail_token_id = int(req.origin_input_ids[-1])
+            else:
+                raise AssertionError(
+                    f"Draft request {req.rid} has no token to decode from"
+                )
+
+            old_seq_len = None
+            if batch.seq_lens_cpu is not None:
+                # Save the old per-request seq_len so seq_lens_sum can be adjusted by
+                # delta. req_batch_idx is the inclusive index of this req in batch.reqs.
+                old_seq_len = int(batch.seq_lens_cpu[req_batch_idx].item())
+                batch.seq_lens_cpu[req_batch_idx] = new_seq_len
+
+            # Mirror the same new_seq_len into every per-request seq_len buffer.
+            if batch.seq_lens is not None:
+                batch.seq_lens[req_batch_idx] = new_seq_len
+            if batch.orig_seq_lens is not None:
+                batch.orig_seq_lens[req_batch_idx] = new_seq_len
+
+            # The batch-level output_ids entry is not the whole output sequence. It is
+            # exactly the one tail token for this request's next decode step.
+            if batch.output_ids is not None:
+                batch.output_ids[req_batch_idx] = new_tail_token_id
+
+            if batch.seq_lens_sum is not None:
+                if old_seq_len is not None:
+                    # Incrementally maintain sum(seq_lens). This is equivalent to
+                    # replacing one element: sum' = sum - old_seq_len + new_seq_len.
+                    batch.seq_lens_sum += new_seq_len - old_seq_len
+                elif batch.seq_lens_cpu is not None:
+                    # Fallback when the old value was unavailable: recompute the full
+                    # sum over all requests in the batch.
+                    batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
+
+
+
+    def _draft_release_req(self: Scheduler, req: Req) -> None:
+        """
+        release a draft request only when it has completed at the verifier side:
+        1. evict the req from waiting_queue or running_batch
+        2. remove the req from the draft request table, and clear the draft related states in the req, including draft_key, pending verify commits, verifier_committed_prefix_len, etc.
+        3. release its kvcache
+        """
+        assert req.draft_key is not None, "Only draft requests with draft_key should be released with _draft_release_req"
+
+        draft_key = req.draft_key
+
+        # remove the req from waiting_queue or running_batch
+        self.waiting_queue = [
+            queued_req for queued_req in self.waiting_queue if queued_req is not req
+        ]
+        if getattr(self, "running_batch", None) is not None and self.running_batch.reqs:
+            keep_indices = [
+                i
+                for i, running_req in enumerate(self.running_batch.reqs)
+                if running_req is not req
+            ]
+            self.running_batch.filter_batch(keep_indices=keep_indices)
+        self.draft_req_table.pop(draft_key, None)
+        req.draft_pending_verify_commits.clear()
+        req.draft_key = None
+        req.verifier_committed_prefix_len = 0
+        release_kv_cache(req, self.tree_cache, is_insert=False)
+
+
+    def _draft_apply_sync(
+        self: Scheduler,
+        req: Req,
+        message: DraftSync,
+    ) -> None:
+        if req.draft_key is not None:
+            raise RuntimeError(
+                "Decoupled draft sync only supports creating a new draft request: "
+                f"request_id={message.request_id}"
+            )
+        req.draft_key = message.draft_key
+        # drafter must greedily sampling draft tokens, till recv DraftClose message from verifier
+        req.sampling_params.temperature = 0.0
+        req.sampling_params.top_k = 1
+        req.sampling_params.ignore_eos = True
+
+        req.verifier_committed_prefix_len = len(req.output_ids)
+        req.fill_ids = req.origin_input_ids + req.output_ids
+        req.draft_pending_verify_commits.clear()
+        self.draft_req_table[message.draft_key] = req
+
+    def _draft_create_req(
+        self: Scheduler,
+        message: DraftSync,
+    ) -> Req:
+        """
+        Create a new request based on DraftSync message
+        """
+        sampling_params = SamplingParams(
+            max_new_tokens=1 << 30, # a very large number to ensure the drafter keeps sampling until receiving DraftClose
+            temperature=0.0,
+            top_k=1,
+            ignore_eos=True,
+        )
+        sampling_params.normalize(self.tokenizer)
+        sampling_params.verify(self.model_config.vocab_size)
+
+        req = Req(
+            build_draft_scheduler_rid(message.request_id),
+            "",
+            list(message.prompt_token_ids),
+            sampling_params,
+            return_logprob=False,
+            stream=False,
+            eos_token_ids=self.model_config.hf_eos_token_id,
+            vocab_size=self.model_config.vocab_size,
+            metrics_collector=(self.metrics_collector if self.enable_metrics else None),
+        )
+        req.tokenizer = self.tokenizer
+        req.output_ids = list(message.committed_output_ids)
+        req.fill_ids = req.origin_input_ids + req.output_ids
+        self.init_req_max_new_tokens(req)
+        return req
+
+
+    def _drain_post_decode_draft_control_messages(
+        self: Scheduler,
+    ) -> list[VerifyCommit | DraftClose]:
+        """
+        (called by decoupled drafter)
+        Drain all VerifyCommit and DraftClose messages from draft adapter thread
+        """
+        messages: list[DraftControlMessage] | None = None
+        if self._is_decoupled_draft_entry_rank():
+            messages = self._get_draft_adapter_thread().drain_post_result_messages()
+
+        return [
+            message
+            for message in self._broadcast_draft_control_messages(messages)
+            if isinstance(message, (VerifyCommit, DraftClose))
+        ]
+
+
+    def _handle_draft_sync_messages(self: Scheduler) -> None:
+        """
+        (called by decoupled drafter)
+        Drain DraftSync messages from draft adapter thread, and handle them.
+        DraftSync creates a new drafter-side request from verifier state.
+        """
+
+        messages: list[DraftControlMessage] | None = None
+        if self._is_decoupled_draft_entry_rank():
+            messages = self._get_draft_adapter_thread().drain_sync_messages()
+
+        messages = [
+            message
+            for message in self._broadcast_draft_control_messages(messages)
+            if isinstance(message, DraftSync)
+        ]
+    
+        if not messages:
+            return
+
+        for message in messages:
+            draft_key = message.draft_key
+            req = self.draft_req_table.get(draft_key)
+            if req is not None:
+                raise RuntimeError(
+                    "Received DraftSync for an existing decoupled draft request: "
+                    f"request_id={message.request_id}"
+                )
+            req = self._draft_create_req(message)
+            self._draft_apply_sync(req, message)
+            running_batch = self.running_batch
+            if req not in self.waiting_queue and req not in running_batch.reqs:
+                self._add_request_to_queue(req)
+
+
+    def _draft_apply_commits_and_maybe_emit(
+        self: Scheduler,
+        req: Req,
+        *,
+        commits: Optional[list[VerifyCommit]] = None,
+        batch: ScheduleBatch,
+        req_batch_idx: int,
+        decoded_token: Optional[tuple[int, int]] = None,
+    ) -> DraftTailStreamOutput | None:
+        """
+        1. apply the pending verify commits to the req,
+          and update its verifier_committed_prefix_len and other states(if needed)
+        2. if the bonus token is not overwritten,
+          this req is considered having decoded a new valid draft token,
+          therefore, drafter will send this draft token to verifier,
+          as streaming draft token output
+        """
+        assert req.draft_key is not None, "Only draft requests with draft_key should be applied with _draft_apply_commits_and_maybe_emit"
+
+        commits_to_apply: list[VerifyCommit] = []
+        if req.draft_pending_verify_commits:
+            # check the pending VerifyCommits: received when req is not in running batch
+            commits_to_apply.extend(req.draft_pending_verify_commits)
+            req.draft_pending_verify_commits.clear()
+        
+        if commits:
+            commits_to_apply.extend(commits)
+
+        for verify_commit in commits_to_apply:
+            self._draft_apply_verify_commit(
+                req,
+                verify_commit,
+                batch=batch,
+                req_batch_idx=req_batch_idx,
+            )
+
+        if not self._is_decoupled_draft_entry_rank() or decoded_token is None:
+            return None
+
+        token_pos, token_id = (int(decoded_token[0]), int(decoded_token[1]))
+        committed_len = int(req.verifier_committed_prefix_len)
+        if (
+            token_pos >= committed_len
+            and token_pos < len(req.output_ids)
+            and int(req.output_ids[token_pos]) == token_id
+        ):
+            return DraftTailStreamOutput(
+                request_id=req.draft_key.request_id,
+                src_drafter_rank=int(getattr(self, "dp_rank", 0) or 0),
+                dst_verifier_rank=req.draft_key.src_verifier_rank,
+                base_committed_len=committed_len,
+                new_token_pos=token_pos,
+                new_token_id=token_id,
+            )
+        return None
+
+
+    def _draft_process_post_decode_controls(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        decoded_tokens: list[Optional[tuple[int, int]]],
+        control_messages: list[VerifyCommit | DraftClose],
+    ) -> list[DraftTailStreamOutput]:
+        """
+        args:
+          decoded_tokens: the list of (token_pos, token_id) for each new decoded token
+          control_messages: VerifyCommit and DraftClose message received from verifier
+
+        called by decoupled drafter, during `process_batch_result_decode()`:
+        1. apply DraftClose message: release the draft req
+        2. apply VerifyCommit message to the req, and collect & send new draft token
+        """
+        # build draft_key -> req mapping
+        current_req_by_key: dict[DraftReqKey, Req] = {}
+        for req in batch.reqs:
+            assert (
+                req.draft_key is not None
+            ), "Decoupled drafter batch should only contain draft requests"
+            current_req_by_key[req.draft_key] = req
+
+        # collect each req's VerifyCommit message
+        commits_by_key: dict[DraftReqKey, list[VerifyCommit]] = {}
+        closed_keys: set[DraftReqKey] = set()
+        for message in control_messages:
+            draft_key = message.draft_key
+            req = self.draft_req_table.get(draft_key)
+            if isinstance(message, DraftClose):
+                # this req will be release upon recv DraftClose
+                # discard its pending VerifyCommits
+                closed_keys.add(draft_key)
+                commits_by_key.pop(draft_key, None)
+                if req is not None and req.draft_key is not None:
+                    self._draft_release_req(req)
+                continue
+
+            if draft_key in closed_keys:
+                continue
+
+            if req is None:
+                raise RuntimeError(
+                    "Received VerifyCommit for an unknown decoupled draft request: "
+                    f"request_id={message.request_id} "
+                    f"src_verifier_rank={message.src_verifier_rank}"
+                )
+            
+            assert (
+                req.draft_key == draft_key
+            ), "draft_req_table contains a request under a mismatched draft_key"
+            if draft_key in current_req_by_key:
+                commits_by_key.setdefault(draft_key, []).append(message)
+            else:
+                # if the req is not in current batch, cache the pending VerifyCommit message
+                req.draft_pending_verify_commits.append(message)
+
+        # apply VerifyCommit and send new draft token
+        stream_outputs: list[DraftTailStreamOutput] = []
+        for req_batch_idx, req in enumerate(batch.reqs):
+            draft_key = req.draft_key
+            assert draft_key is not None
+            decoded_token = (
+                decoded_tokens[req_batch_idx]
+                if req_batch_idx < len(decoded_tokens)
+                else None
+            )
+            stream_output = self._draft_apply_commits_and_maybe_emit(
+                req,
+                commits=commits_by_key.get(draft_key),
+                batch=batch,
+                req_batch_idx=req_batch_idx,
+                decoded_token=decoded_token,
+            )
+            if stream_output is not None:
+                stream_outputs.append(stream_output)
+        return stream_outputs
 
     def _get_storage_backend_type(self) -> str:
         """Get storage backend type from tree_cache."""
@@ -129,8 +629,7 @@ class SchedulerOutputProcessorMixin:
                     req.rid,
                     thread_finish_flag=True,
                 )
-                if not self._maybe_preserve_draft_req(req):
-                    release_kv_cache(req, self.tree_cache)
+                release_kv_cache(req, self.tree_cache)
 
         # Note: Logprobs should be handled on the prefill engine.
         trace_slice_batch(RequestStage.DECODE_FAKE_OUTPUT, batch.reqs)
@@ -210,8 +709,7 @@ class SchedulerOutputProcessorMixin:
 
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
-                        if not self._maybe_preserve_draft_req(req):
-                            release_kv_cache(req, self.tree_cache)
+                        release_kv_cache(req, self.tree_cache)
                         req.time_stats.completion_time = time.perf_counter()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
@@ -345,8 +843,7 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
 
                     if req.finished():
-                        if not self._maybe_preserve_draft_req(req):
-                            release_kv_cache(req, self.tree_cache)
+                        release_kv_cache(req, self.tree_cache)
                     else:
                         self.tree_cache.cache_unfinished_req(req)
                 else:
@@ -433,8 +930,7 @@ class SchedulerOutputProcessorMixin:
                 req.output_ids.append(next_token_id)
                 req.check_finished()
                 if req.finished():
-                    if not self._maybe_preserve_draft_req(req):
-                        release_kv_cache(req, self.tree_cache)
+                    release_kv_cache(req, self.tree_cache)
                     req.time_stats.completion_time = time.perf_counter()
                     break
 
@@ -456,14 +952,10 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
-        decode_output_process_start = time.perf_counter()
-        copy_done_sync_duration_ms = 0.0
+        is_decoupled_draft = bool(batch.spec_algorithm.is_decoupled_draft())
+        is_decoupled_verify = bool(batch.spec_algorithm.is_decoupled_verify())
         if result.copy_done is not None:
-            copy_done_sync_start = time.perf_counter()
             result.copy_done.synchronize()
-            copy_done_sync_duration_ms = round(
-                (time.perf_counter() - copy_done_sync_start) * 1000, 3
-            )
 
         logits_output, next_token_ids, can_run_cuda_graph = (
             result.logits_output,
@@ -471,52 +963,43 @@ class SchedulerOutputProcessorMixin:
             result.can_run_cuda_graph,
         )
 
-        next_token_ids_to_list_duration_ms = 0.0
-        if _treat_as_normal_decode(batch.spec_algorithm):
-            next_token_ids_to_list_start = time.perf_counter()
+        if batch.spec_algorithm.is_none() or is_decoupled_draft:
             next_token_ids = next_token_ids.tolist()
-            next_token_ids_to_list_duration_ms = round(
-                (time.perf_counter() - next_token_ids_to_list_start) * 1000, 3
-            )
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
         elif batch.is_spec_v2:
             next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
+        elif is_decoupled_verify:
+            # Decoupled verify reuses the EAGLE/spec-v1 verify path, which
+            # mutates req.output_ids and checks finish inside the worker.
+            # Keep scheduler-side handling aligned with the v0.5.9 spec-v1
+            # contract: do not append the returned verified ids a second time.
+            next_token_ids = [None] * len(batch.reqs)
 
         self.num_generated_tokens += len(batch.reqs)
-        if not _treat_as_normal_decode(batch.spec_algorithm):
+        if not batch.spec_algorithm.is_none() or is_decoupled_draft:
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
+
         if self.enable_metrics:
             self.metrics_collector.increment_cuda_graph_pass(value=can_run_cuda_graph)
 
-        free_group_begin_start = time.perf_counter()
         self.token_to_kv_pool_allocator.free_group_begin()
-        free_group_begin_duration_ms = round(
-            (time.perf_counter() - free_group_begin_start) * 1000, 3
-        )
 
         # NOTE: in any case, we should check finish here
         # if finished, also clean up committed kv cache and over-allocated kv cache here
 
         # Check finish condition
-        req_loop_start = time.perf_counter()
-        append_output_duration_ms = 0.0
-        check_finished_duration_ms = 0.0
-        preserve_draft_duration_ms = 0.0
-        preserve_session_lookup_ms = 0.0
-        preserve_session_fetch_ms = 0.0
-        preserve_kv_copy_ms = 0.0
-        preserve_free_overallocated_ms = 0.0
-        preserve_assert_previous_ms = 0.0
-        preserve_session_update_ms = 0.0
-        preserve_req_pool_free_ms = 0.0
-        release_kv_duration_ms = 0.0
-        customized_info_duration_ms = 0.0
-        grammar_duration_ms = 0.0
-        finished_req_count = 0
-        preserved_draft_req_count = 0
-        released_req_count = 0
-        for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+        req_iter = (
+            (i, req, next_token_id)
+            for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids))
+        )
+
+        # newly decoded (token_pos, token_id) for all reqs in this batch
+        decoded_draft_tokens: list[Optional[tuple[int, int]]] = (
+            [None] * len(batch.reqs) if is_decoupled_draft else []
+        )
+
+        for i, req, next_token_id in req_iter:
             req: Req
 
             if self.enable_overlap and (req.finished() or req.is_retracted):
@@ -526,133 +1009,48 @@ class SchedulerOutputProcessorMixin:
                 continue
 
             new_accepted_len = 1
-            if _treat_as_normal_decode(batch.spec_algorithm):
-                append_output_start = time.perf_counter()
+            if (
+                batch.spec_algorithm.is_none()
+                or batch.spec_algorithm.is_decoupled_draft()
+            ):
+                if is_decoupled_draft:
+                    decoded_draft_tokens[i] = (len(req.output_ids), int(next_token_id))
                 req.output_ids.append(next_token_id)
-                append_output_duration_ms += (
-                    time.perf_counter() - append_output_start
-                ) * 1000
             elif batch.is_spec_v2:
                 # Only spec v2's output_ids are updated here.
-                append_output_start = time.perf_counter()
                 req.output_ids.extend(next_token_id)
-                append_output_duration_ms += (
-                    time.perf_counter() - append_output_start
-                ) * 1000
                 new_accepted_len = len(next_token_id)
+            elif is_decoupled_verify:
+                # Output ids were already committed by EAGLE/spec-v1 verify.
+                pass
 
             # Update Mamba last track seqlen
             self._mamba_prefix_cache_update(req, batch, result, i)
 
-            check_finished_start = time.perf_counter()
-            req.check_finished(new_accepted_len)
-            check_finished_duration_ms += (
-                time.perf_counter() - check_finished_start
-            ) * 1000
+            # External decoupled drafter must not finish locally based on draft
+            # tokens. The verifier still owns finished state, matching the
+            # v0.5.9 spec-v1 post-processing contract.
+            if not is_decoupled_draft:
+                req.check_finished(new_accepted_len)
 
             if req.finished():
-                finished_req_count += 1
                 self.maybe_collect_routed_experts(req)
 
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                     if not self.decode_offload_manager.offload_kv_cache(req):
-                        preserve_start = time.perf_counter()
-                        preserved = self._maybe_preserve_draft_req(req)
-                        preserve_duration_ms = round(
-                            (time.perf_counter() - preserve_start) * 1000, 3
-                        )
-                        preserve_draft_duration_ms += preserve_duration_ms
-                        preserve_breakdown = getattr(
-                            req, "_draft_preserve_breakdown", None
-                        )
-                        if preserve_breakdown:
-                            preserve_session_lookup_ms += float(
-                                preserve_breakdown.get("session_lookup_ms", 0.0) or 0.0
-                            )
-                            preserve_session_fetch_ms += float(
-                                preserve_breakdown.get("session_fetch_ms", 0.0) or 0.0
-                            )
-                            preserve_kv_copy_ms += float(
-                                preserve_breakdown.get("kv_copy_ms", 0.0) or 0.0
-                            )
-                            preserve_free_overallocated_ms += float(
-                                preserve_breakdown.get(
-                                    "free_overallocated_ms", 0.0
-                                )
-                                or 0.0
-                            )
-                            preserve_assert_previous_ms += float(
-                                preserve_breakdown.get("assert_previous_ms", 0.0)
-                                or 0.0
-                            )
-                            preserve_session_update_ms += float(
-                                preserve_breakdown.get("session_update_ms", 0.0)
-                                or 0.0
-                            )
-                            preserve_req_pool_free_ms += float(
-                                preserve_breakdown.get("req_pool_free_ms", 0.0) or 0.0
-                            )
-                        if preserved:
-                            preserved_draft_req_count += 1
-                        if not preserved:
-                            release_start = time.perf_counter()
-                            release_kv_cache(req, self.tree_cache)
-                            release_duration_ms = round(
-                                (time.perf_counter() - release_start) * 1000, 3
-                            )
-                            release_kv_duration_ms += release_duration_ms
-                            released_req_count += 1
-                else:
-                    preserve_start = time.perf_counter()
-                    preserved = self._maybe_preserve_draft_req(req)
-                    preserve_duration_ms = round(
-                        (time.perf_counter() - preserve_start) * 1000, 3
-                    )
-                    preserve_draft_duration_ms += preserve_duration_ms
-                    preserve_breakdown = getattr(req, "_draft_preserve_breakdown", None)
-                    if preserve_breakdown:
-                        preserve_session_lookup_ms += float(
-                            preserve_breakdown.get("session_lookup_ms", 0.0) or 0.0
-                        )
-                        preserve_session_fetch_ms += float(
-                            preserve_breakdown.get("session_fetch_ms", 0.0) or 0.0
-                        )
-                        preserve_kv_copy_ms += float(
-                            preserve_breakdown.get("kv_copy_ms", 0.0) or 0.0
-                        )
-                        preserve_free_overallocated_ms += float(
-                            preserve_breakdown.get("free_overallocated_ms", 0.0) or 0.0
-                        )
-                        preserve_assert_previous_ms += float(
-                            preserve_breakdown.get("assert_previous_ms", 0.0) or 0.0
-                        )
-                        preserve_session_update_ms += float(
-                            preserve_breakdown.get("session_update_ms", 0.0) or 0.0
-                        )
-                        preserve_req_pool_free_ms += float(
-                            preserve_breakdown.get("req_pool_free_ms", 0.0) or 0.0
-                        )
-                    if preserved:
-                        preserved_draft_req_count += 1
-                    if not preserved:
-                        release_start = time.perf_counter()
                         release_kv_cache(req, self.tree_cache)
-                        release_duration_ms = round(
-                            (time.perf_counter() - release_start) * 1000, 3
-                        )
-                        release_kv_duration_ms += release_duration_ms
-                        released_req_count += 1
+                else:
+                    release_kv_cache(req, self.tree_cache)
 
                 req.time_stats.completion_time = time.perf_counter()
 
-            customized_info_start = time.perf_counter()
             self.maybe_collect_customized_info(i, req, logits_output)
-            customized_info_duration_ms += (
-                time.perf_counter() - customized_info_start
-            ) * 1000
 
-            if req.return_logprob and _treat_as_normal_decode(batch.spec_algorithm):
+            if req.return_logprob and (
+                batch.spec_algorithm.is_none()
+                or batch.spec_algorithm.is_decoupled_draft()
+            ):
                 # speculative worker handles logprob in speculative decoding
                 req.output_token_logprobs_val.append(next_token_logprobs[i])
                 req.output_token_logprobs_idx.append(next_token_id)
@@ -676,11 +1074,13 @@ class SchedulerOutputProcessorMixin:
                     logits_output.hidden_states[i].cpu().clone().tolist()
                 )
 
-            if req.grammar is not None:
+            if req.grammar is not None and not is_decoupled_verify:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
-                grammar_start = time.perf_counter()
                 try:
-                    if _treat_as_normal_decode(batch.spec_algorithm):
+                    if (
+                        batch.spec_algorithm.is_none()
+                        or batch.spec_algorithm.is_decoupled_draft()
+                    ):
                         # Normal decode: single token
                         req.grammar.accept_token(next_token_id)
                     elif batch.is_spec_v2:
@@ -695,51 +1095,20 @@ class SchedulerOutputProcessorMixin:
                     )
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
-                grammar_duration_ms += (time.perf_counter() - grammar_start) * 1000
 
-        req_loop_duration_ms = round((time.perf_counter() - req_loop_start) * 1000, 3)
-        stream_output_start = time.perf_counter()
+        if is_decoupled_draft:
+            post_decode_messages = self._drain_post_decode_draft_control_messages()
+            stream_outputs = (
+                self._draft_process_post_decode_controls(
+                    batch,
+                    decoded_draft_tokens,
+                    post_decode_messages,
+                )
+            )
+            self._submit_draft_tokens_stream(stream_outputs)
+
         self.stream_output(batch.reqs, batch.return_logprob)
-        stream_output_duration_ms = round(
-            (time.perf_counter() - stream_output_start) * 1000, 3
-        )
-        free_group_end_start = time.perf_counter()
         self.token_to_kv_pool_allocator.free_group_end()
-        free_group_end_duration_ms = round(
-            (time.perf_counter() - free_group_end_start) * 1000, 3
-        )
-        decode_output_process_duration_ms = round(
-            (time.perf_counter() - decode_output_process_start) * 1000, 3
-        )
-        batch._draft_stage_process_breakdown = {
-            "decode_batch_size": len(batch.reqs),
-            "copy_done_sync_ms": copy_done_sync_duration_ms,
-            "next_token_ids_to_list_ms": next_token_ids_to_list_duration_ms,
-            "free_group_begin_ms": free_group_begin_duration_ms,
-            "req_loop_ms": req_loop_duration_ms,
-            "append_output_ms": round(append_output_duration_ms, 3),
-            "check_finished_ms": round(check_finished_duration_ms, 3),
-            "preserve_draft_ms": round(preserve_draft_duration_ms, 3),
-            "preserve_session_lookup_ms": round(preserve_session_lookup_ms, 3),
-            "preserve_session_fetch_ms": round(preserve_session_fetch_ms, 3),
-            "preserve_kv_copy_ms": round(preserve_kv_copy_ms, 3),
-            "preserve_free_overallocated_ms": round(
-                preserve_free_overallocated_ms, 3
-            ),
-            "preserve_assert_previous_ms": round(preserve_assert_previous_ms, 3),
-            "preserve_session_update_ms": round(preserve_session_update_ms, 3),
-            "preserve_req_pool_free_ms": round(preserve_req_pool_free_ms, 3),
-            "release_kv_ms": round(release_kv_duration_ms, 3),
-            "customized_info_ms": round(customized_info_duration_ms, 3),
-            "grammar_ms": round(grammar_duration_ms, 3),
-            "stream_output_ms": stream_output_duration_ms,
-            "free_group_end_ms": free_group_end_duration_ms,
-            "finished_req_count": finished_req_count,
-            "preserved_draft_req_count": preserved_draft_req_count,
-            "released_req_count": released_req_count,
-            "total_decode_process_ms": decode_output_process_duration_ms,
-        }
-
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
         if self.current_scheduler_metrics_enabled:
@@ -756,14 +1125,18 @@ class SchedulerOutputProcessorMixin:
         if req.mamba_ping_pong_track_buffer is not None:
             mamba_track_interval = get_global_server_args().mamba_track_interval
             if (
-                _treat_as_normal_decode(batch.spec_algorithm)
+                (
+                    batch.spec_algorithm.is_none()
+                    or batch.spec_algorithm.is_decoupled_draft()
+                )
                 and seq_len % mamba_track_interval == 0
             ):
                 # for non-spec decode, we update mamba_last_track_seqlen at the end of each track interval
                 req.mamba_next_track_idx = 1 - req.mamba_next_track_idx
                 req.mamba_last_track_seqlen = seq_len
             elif (
-                not _treat_as_normal_decode(batch.spec_algorithm)
+                not batch.spec_algorithm.is_none()
+                and not batch.spec_algorithm.is_decoupled_draft()
                 and result.accept_length_per_req_cpu is not None
             ):
                 # for spec decode, update mamba_last_track_seqlen if this iteration crosses a track interval
@@ -1079,6 +1452,8 @@ class SchedulerOutputProcessorMixin:
         skip_req: Optional[Req] = None,
     ):
         """Stream the output to detokenizer."""
+        if self.spec_algorithm.is_decoupled_draft():
+            return
         if self.is_generation:
             self.stream_output_generation(reqs, return_logprob, skip_req)
         else:  # embedding or reward model
@@ -1107,12 +1482,9 @@ class SchedulerOutputProcessorMixin:
         skip_req: Optional[Req] = None,
         is_idle_batch: bool = False,
     ):
-        stream_generation_start = time.perf_counter()
-        payload_build_start = time.perf_counter()
         rids = []
         http_worker_ipcs = []
         finished_reasons: List[BaseFinishReason] = []
-        output_reqs: List[Req] = []
 
         decoded_texts = []
         decode_ids_list = []
@@ -1207,7 +1579,6 @@ class SchedulerOutputProcessorMixin:
                     )
 
             if should_output:
-                output_reqs.append(req)
                 send_token_offset = req.send_token_offset
                 send_output_token_logprobs_offset = (
                     req.send_output_token_logprobs_offset
@@ -1257,7 +1628,7 @@ class SchedulerOutputProcessorMixin:
                     req.time_stats.get_prefill_finished_ts()
                 )
 
-                if not _treat_as_normal_decode(self.spec_algorithm):
+                if not self.spec_algorithm.is_none() and not self.spec_algorithm.is_decoupled_draft():
                     spec_verify_ct.append(req.spec_verify_ct)
                     spec_accepted_tokens.append(req.spec_accepted_tokens)
                     spec_acceptance_histogram.append(req.spec_acceptance_histogram)
@@ -1356,10 +1727,6 @@ class SchedulerOutputProcessorMixin:
         if reqs or is_idle_batch:
             if self.model_config.is_multimodal_gen:
                 return
-            payload_build_duration_ms = round(
-                (time.perf_counter() - payload_build_start) * 1000, 3
-            )
-            send_to_detokenizer_start = time.perf_counter()
             self.send_to_detokenizer.send_output(
                 BatchTokenIDOutput(
                     rids=rids,
@@ -1405,9 +1772,6 @@ class SchedulerOutputProcessorMixin:
                     retraction_counts=retraction_counts,
                     load=load,
                 )
-            )
-            send_to_detokenizer_duration_ms = round(
-                (time.perf_counter() - send_to_detokenizer_start) * 1000, 3
             )
 
     def stream_output_embedding(self: Scheduler, reqs: List[Req]):

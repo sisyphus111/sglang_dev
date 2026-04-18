@@ -32,7 +32,7 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.srt.speculative.decoupled_spec_io import DraftBackendIpcConfig
+from sglang.srt.speculative.decoupled_spec_io import DraftMeshIpcConfig
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
@@ -480,6 +480,8 @@ class ServerArgs:
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
+    decoupled_spec_control_endpoints: Optional[List[str]] = None
+    decoupled_spec_result_endpoints: Optional[List[str]] = None
 
     # Speculative decoding (ngram)
     speculative_ngram_min_match_window_size: int = 1
@@ -2385,6 +2387,13 @@ class ServerArgs:
                 )
             self.disable_overlap_schedule = True
 
+            if self.speculative_algorithm == "DECOUPLED_DRAFT":
+                if not self.disable_radix_cache:
+                    logger.warning(
+                        "Radix cache is disabled for decoupled drafter."
+                    )
+                self.disable_radix_cache = True
+
             if self.enable_mixed_chunk:
                 self.enable_mixed_chunk = False
                 logger.warning(
@@ -4092,6 +4101,24 @@ class ServerArgs:
             default=ServerArgs.speculative_draft_model_quantization,
             help="The quantization method for speculative model.",
         )
+        parser.add_argument(
+            "--decoupled-spec-control-endpoints",
+            type=json_list_type,
+            default=ServerArgs.decoupled_spec_control_endpoints,
+            help=(
+                "JSON list of verifier->drafter control ZMQ endpoints for "
+                "decoupled speculative decoding."
+            ),
+        )
+        parser.add_argument(
+            "--decoupled-spec-result-endpoints",
+            type=json_list_type,
+            default=ServerArgs.decoupled_spec_result_endpoints,
+            help=(
+                "JSON list of drafter->verifier result ZMQ endpoints for "
+                "decoupled speculative decoding."
+            ),
+        )
 
         # Speculative decoding (ngram)
         parser.add_argument(
@@ -5193,6 +5220,11 @@ class ServerArgs:
     def enable_mamba_extra_buffer(self) -> bool:
         return self.mamba_scheduler_strategy == "extra_buffer"
 
+    def get_mamba_state_slots_per_req(self) -> int:
+        if self.enable_mamba_extra_buffer():
+            return 2 if self.speculative_num_draft_tokens is not None else 3
+        return 1
+
     @property
     def mamba_cache_chunk_size(self) -> int:
         # For mamba cache with extra buffer, the chunk size is the max of FLA_CHUNK_SIZE and page_size.
@@ -5689,8 +5721,8 @@ class PortArgs:
     # The ipc filename for Tokenizer and worker tokenizer
     tokenizer_worker_ipc_name: Optional[str]
 
-    # The ipc endpoints between verifier scheduler and draft backend
-    draft_backend_ipc_config: Optional[DraftBackendIpcConfig]
+    # The ipc endpoints between verifier scheduler and drafter scheduler
+    draft_mesh_ipc_config: Optional[DraftMeshIpcConfig]
 
     @staticmethod
     def init_new(
@@ -5710,9 +5742,26 @@ class PortArgs:
                 f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
             )
 
-        draft_backend_ipc_config = None
-        if server_args.speculative_algorithm == "DECOUPLED_VERIFY":
-            draft_backend_ipc_config = DraftBackendIpcConfig.init_new(server_args.dp_size)
+        draft_mesh_ipc_config = None
+        if server_args.speculative_algorithm in ("DECOUPLED_VERIFY", "DECOUPLED_DRAFT"):
+            if (
+                server_args.decoupled_spec_control_endpoints is not None
+                or server_args.decoupled_spec_result_endpoints is not None
+            ):
+                if (
+                    server_args.decoupled_spec_control_endpoints is None
+                    or server_args.decoupled_spec_result_endpoints is None
+                ):
+                    raise ValueError(
+                        "Both --decoupled-spec-control-endpoints and "
+                        "--decoupled-spec-result-endpoints must be provided together."
+                    )
+                draft_mesh_ipc_config = DraftMeshIpcConfig.from_endpoint_lists(
+                    server_args.decoupled_spec_control_endpoints,
+                    server_args.decoupled_spec_result_endpoints,
+                )
+            else:
+                draft_mesh_ipc_config = DraftMeshIpcConfig.init_new(server_args.dp_size)
 
         if not server_args.enable_dp_attention:
             # Normal case, use IPC within a single node
@@ -5724,7 +5773,7 @@ class PortArgs:
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
-                draft_backend_ipc_config=draft_backend_ipc_config,
+                draft_mesh_ipc_config=draft_mesh_ipc_config,
             )
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
@@ -5779,7 +5828,7 @@ class PortArgs:
                 rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_port}",
                 metrics_ipc_name=f"tcp://{dist_init_host}:{metrics_ipc_name}",
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
-                draft_backend_ipc_config=draft_backend_ipc_config,
+                draft_mesh_ipc_config=draft_mesh_ipc_config,
             )
 
 

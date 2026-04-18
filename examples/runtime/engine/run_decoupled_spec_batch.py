@@ -3,7 +3,7 @@ Batch decoupled speculative decoding demo backed by a parquet file.
 
 This script:
 1. Launches a `decoupled_draft` SGLang engine inside a Ray actor.
-2. Launches a `decoupled_verify` SGLang engine that talks to the drafter actor.
+2. Launches a `decoupled_verify` SGLang engine connected to the drafter over ZMQ.
 3. Reads prompts from a parquet file starting at `offset` and taking `batch_size`.
 4. Sends the prompt batch to the verifier in a single `generate` call.
 5. Prints per-request outputs and aggregate latency stats.
@@ -12,6 +12,7 @@ This script:
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import re
@@ -25,7 +26,7 @@ from typing import Any
 import ray
 import sglang as sgl
 import torch
-from sglang.srt.speculative.decoupled_spec_io import DraftRequest, DraftResult
+from sglang.srt.speculative.decoupled_spec_io import DraftMeshIpcConfig
 
 ACTOR_NAME = "sglang-decoupled-drafter"
 RAY_NAMESPACE = "sglang-decoupled-spec"
@@ -40,6 +41,7 @@ DEFAULT_PROMPT_COLUMN_CANDIDATES = [
     "input",
     "query",
 ]
+DAPO_MATH_17K_DEFAULT_PROMPT_COLUMN = "prompt"
 
 
 @dataclass
@@ -78,6 +80,26 @@ def parse_args() -> argparse.Namespace:
         "--parquet-path",
         required=True,
         help="Path to the parquet file that stores the prompts.",
+    )
+    parser.add_argument(
+        "--prompt-column",
+        default=None,
+        help=(
+            "Prompt column in the parquet file. If omitted, common names are "
+            f"searched in order: {DEFAULT_PROMPT_COLUMN_CANDIDATES}."
+        ),
+    )
+    parser.add_argument(
+        "--dataset-format",
+        choices=["auto", "dapo_math_17k"],
+        default="auto",
+        help=(
+            "How to interpret the parquet rows. "
+            "'auto' reads one prompt-like column. "
+            "'dapo_math_17k' reads the DAPO-Math-17k prompt message list from "
+            "its structured parquet column and renders it through the target "
+            "model tokenizer chat template when available."
+        ),
     )
     parser.add_argument(
         "--offset",
@@ -237,6 +259,8 @@ class DraftEngineActor:
         gpu_ids: list[str],
         tp_size: int,
         speculative_num_steps: int,
+        control_endpoints: list[str],
+        result_endpoints: list[str],
     ):
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_ids)
         self.drafter = sgl.Engine(
@@ -245,26 +269,14 @@ class DraftEngineActor:
             speculative_algorithm="DECOUPLED_DRAFT",
             speculative_num_steps=speculative_num_steps,
             speculative_num_draft_tokens=speculative_num_steps + 1,
+            decoupled_spec_control_endpoints=control_endpoints,
+            decoupled_spec_result_endpoints=result_endpoints,
             disable_radix_cache=True,
             chunked_prefill_size=-1,
         )
 
     def ready(self) -> bool:
         return True
-
-    async def handle_draft_request(self, request: DraftRequest) -> DraftResult:
-        return await self.drafter.handle_draft_request(request)
-
-    async def handle_draft_requests(
-        self, requests: list[DraftRequest]
-    ) -> list[DraftResult]:
-        return await self.drafter.handle_draft_requests(requests)
-
-    async def terminate_draft_request(self, request_id: str):
-        await self.drafter.terminate_draft_request(request_id)
-
-    async def release_draft_session(self, request_id: str):
-        await self.drafter.release_draft_session(request_id)
 
     def shutdown(self) -> None:
         self.drafter.shutdown()
@@ -300,18 +312,36 @@ def allocate_demo_gpus(args: argparse.Namespace) -> tuple[list[str], list[str]]:
 
 
 def _get_drafter_debug_env_vars() -> dict[str, str]:
-    env_vars = {}
-    for key in (
-        "DECOUPLED_SPEC_DEBUG_CSV_DIR",
-        "DECOUPLED_SPEC_DEBUG_SUMMARY_INTERVAL_SEC",
+    env_vars: dict[str, str] = {}
+    for env_name in (
+        "SGLANG_DECOUPLED_SPEC_DEBUG",
+        "SGLANG_DECOUPLED_SPEC_TRACE_DIR",
+        "SGLANG_DECOUPLED_SPEC_SUMMARY_INTERVAL",
     ):
-        value = os.environ.get(key)
-        if value:
-            env_vars[key] = value
+        env_value = os.environ.get(env_name)
+        if env_value:
+            env_vars[env_name] = env_value
     return env_vars
 
 
-def launch_drafter_actor(args: argparse.Namespace) -> tuple[ray.actor.ActorHandle, str]:
+def _endpoint_lists(ipc_config: DraftMeshIpcConfig) -> tuple[list[str], list[str]]:
+    return (
+        [
+            ipc_config.control_endpoints[rank]
+            for rank in sorted(ipc_config.control_endpoints)
+        ],
+        [
+            ipc_config.result_endpoints[rank]
+            for rank in sorted(ipc_config.result_endpoints)
+        ],
+    )
+
+
+def launch_drafter_actor(
+    args: argparse.Namespace,
+    control_endpoints: list[str],
+    result_endpoints: list[str],
+) -> ray.actor.ActorHandle:
     actor_options = dict(
         name=ACTOR_NAME,
         num_gpus=args.draft_tp_size,
@@ -325,19 +355,20 @@ def launch_drafter_actor(args: argparse.Namespace) -> tuple[ray.actor.ActorHandl
         gpu_ids=args.draft_gpu_ids,
         tp_size=args.draft_tp_size,
         speculative_num_steps=args.num_speculative_steps,
+        control_endpoints=control_endpoints,
+        result_endpoints=result_endpoints,
     )
     ray.get(actor.ready.remote())
-    return actor, ACTOR_NAME
+    return actor
 
 
 def launch_verifier(
     target_model_path: str,
-    draft_actor_name: str,
-    draft_actor_namespace: str,
     target_tp_size: int,
     speculative_num_steps: int,
     speculative_num_draft_tokens: int,
-    draft_backend_process_kwargs: dict[str, object] | None = None,
+    control_endpoints: list[str],
+    result_endpoints: list[str],
 ) -> sgl.Engine:
     return sgl.Engine(
         model_path=target_model_path,
@@ -345,9 +376,8 @@ def launch_verifier(
         speculative_algorithm="DECOUPLED_VERIFY",
         speculative_num_steps=speculative_num_steps,
         speculative_num_draft_tokens=speculative_num_draft_tokens,
-        draft_actor_names=[draft_actor_name],
-        draft_actor_namespace=draft_actor_namespace,
-        draft_backend_process_kwargs=draft_backend_process_kwargs,
+        decoupled_spec_control_endpoints=control_endpoints,
+        decoupled_spec_result_endpoints=result_endpoints,
     )
 
 
@@ -362,6 +392,21 @@ def infer_prompt_column(
         "Unable to auto-detect the prompt column. "
         f"Available columns: {available_columns}"
     )
+
+
+def resolve_dapo_math_17k_prompt_column(
+    available_columns: list[str],
+    prompt_column: str | None = None,
+) -> str:
+    selected_column = prompt_column or DAPO_MATH_17K_DEFAULT_PROMPT_COLUMN
+    if selected_column not in available_columns:
+        raise ValueError(
+            "dataset-format=dapo_math_17k requires a prompt-style column with "
+            "chat messages. "
+            f"Requested column: {selected_column!r}. "
+            f"Available columns: {available_columns}"
+        )
+    return selected_column
 
 
 def _looks_like_chat_message(value: Any) -> bool:
@@ -400,6 +445,28 @@ def _messages_to_fallback_text(messages: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _get_real_verify_acceptance_stats(
+    meta_info: dict[str, Any],
+) -> tuple[float | None, float | None, int, int, int]:
+    verify_ct = meta_info.get("spec_verify_ct")
+    accepted_tokens = meta_info.get("spec_accept_token_num")
+    draft_tokens = meta_info.get("spec_draft_token_num")
+    if verify_ct is None or accepted_tokens is None or draft_tokens is None:
+        return None, None, 0, 0, 0
+
+    verify_ct = int(verify_ct)
+    accepted_tokens = int(accepted_tokens)
+    draft_tokens = int(draft_tokens)
+    if verify_ct <= 0 or draft_tokens <= 0:
+        return None, None, 0, 0, 0
+
+    # Acclen reports accepted draft tokens only; the verifier-sampled bonus
+    # token is intentionally excluded.
+    accept_length = accepted_tokens / verify_ct
+    accept_rate = accepted_tokens / draft_tokens
+    return accept_length, accept_rate, accepted_tokens, draft_tokens, verify_ct
+
+
 def _maybe_parse_json_prompt(value: Any) -> Any:
     if not isinstance(value, str):
         return value
@@ -409,6 +476,10 @@ def _maybe_parse_json_prompt(value: Any) -> Any:
     try:
         return json.loads(stripped)
     except json.JSONDecodeError:
+        pass
+    try:
+        return ast.literal_eval(stripped)
+    except (SyntaxError, ValueError):
         return value
 
 
@@ -431,7 +502,7 @@ def _maybe_append_chatml_generation_prompt(
 
     # The prompt already ends with an assistant generation prefix.
     if last_role == "assistant" and not stripped.endswith("<|im_end|>"):
-        if enable_thinking and not stripped.endswith("<think>\n"):
+        if enable_thinking and not stripped.endswith("<think>"):
             return stripped + thinking_suffix
         return stripped
 
@@ -469,6 +540,9 @@ def _build_chat_template_renderer(model_path: str, *, enable_thinking: bool = Fa
                 add_generation_prompt=True,
                 tokenize=False,
             )
+            prompt = _maybe_append_chatml_generation_prompt(
+                prompt, enable_thinking=enable_thinking
+            )
         if not isinstance(prompt, str) or not prompt:
             raise ValueError("tokenizer.apply_chat_template returned an empty prompt")
         return prompt
@@ -496,14 +570,32 @@ def _normalize_prompt(
     if _is_chat_message_list(value):
         if chat_template_renderer is not None:
             try:
-                return _maybe_append_chatml_generation_prompt(
-                    chat_template_renderer(value),
-                    enable_thinking=enable_thinking,
-                )
+                return chat_template_renderer(value)
             except Exception:
                 pass
         return _messages_to_fallback_text(value)
     return str(value)
+
+
+def _build_dapo_math_17k_prompt(
+    row: dict[str, Any],
+    *,
+    row_index: int,
+    prompt_column: str,
+    chat_template_renderer,
+    enable_thinking: bool = False,
+) -> str:
+    if prompt_column not in row:
+        raise ValueError(
+            f"Row {row_index} is missing DAPO-Math prompt column {prompt_column!r}."
+        )
+    return _normalize_prompt(
+        row.get(prompt_column),
+        row_index,
+        prompt_column,
+        chat_template_renderer,
+        enable_thinking=enable_thinking,
+    )
 
 
 def load_prompt_batch(
@@ -511,6 +603,8 @@ def load_prompt_batch(
     target_model_path: str,
     offset: int,
     batch_size: int,
+    prompt_column: str | None,
+    dataset_format: str,
     disable_chat_template: bool,
     enable_thinking: bool,
 ) -> tuple[str, list[str], int]:
@@ -536,7 +630,23 @@ def load_prompt_batch(
             f"offset {offset} is out of range for {parquet_path}; total rows: {total_rows}"
         )
 
-    selected_column = infer_prompt_column(parquet_file.schema_arrow.names)
+    column_names = parquet_file.schema_arrow.names
+    if dataset_format == "dapo_math_17k":
+        selected_column = resolve_dapo_math_17k_prompt_column(
+            column_names,
+            prompt_column=prompt_column,
+        )
+        prompt_column_label = f"dapo_math_17k[{selected_column}]"
+        read_columns = [selected_column]
+    else:
+        selected_column = prompt_column or infer_prompt_column(column_names)
+        if selected_column not in column_names:
+            raise ValueError(
+                f"prompt column {selected_column!r} not found. "
+                f"Available columns: {column_names}"
+            )
+        prompt_column_label = selected_column
+        read_columns = [selected_column]
     chat_template_renderer = None
     if not disable_chat_template:
         chat_template_renderer = _build_chat_template_renderer(
@@ -550,38 +660,53 @@ def load_prompt_batch(
 
     for record_batch in parquet_file.iter_batches(
         batch_size=reader_batch_size,
-        columns=[selected_column],
+        columns=read_columns,
     ):
-        column_values = record_batch.column(0).to_pylist()
-        if remaining_skip >= len(column_values):
-            remaining_skip -= len(column_values)
-            current_row += len(column_values)
+        if dataset_format == "dapo_math_17k":
+            batch_rows = record_batch.to_pylist()
+        else:
+            batch_rows = record_batch.column(0).to_pylist()
+
+        if remaining_skip >= len(batch_rows):
+            remaining_skip -= len(batch_rows)
+            current_row += len(batch_rows)
             continue
 
         start_index = remaining_skip
-        end_index = min(len(column_values), start_index + (batch_size - len(prompts)))
+        end_index = min(len(batch_rows), start_index + (batch_size - len(prompts)))
         for local_index in range(start_index, end_index):
             row_index = current_row + local_index
-            prompts.append(
-                _normalize_prompt(
-                    column_values[local_index],
-                    row_index,
-                    selected_column,
-                    chat_template_renderer,
-                    enable_thinking=enable_thinking,
+            if dataset_format == "dapo_math_17k":
+                prompts.append(
+                    _build_dapo_math_17k_prompt(
+                        batch_rows[local_index],
+                        row_index=row_index,
+                        prompt_column=selected_column,
+                        chat_template_renderer=chat_template_renderer,
+                        enable_thinking=enable_thinking,
+                    )
                 )
-            )
+            else:
+                prompts.append(
+                    _normalize_prompt(
+                        batch_rows[local_index],
+                        row_index,
+                        selected_column,
+                        chat_template_renderer,
+                        enable_thinking=enable_thinking,
+                    )
+                )
 
-        current_row += len(column_values)
+        current_row += len(batch_rows)
         remaining_skip = 0
         if len(prompts) >= batch_size:
             break
 
     if not prompts:
         raise ValueError(
-            f"No prompts were loaded from {parquet_path} using column {selected_column!r}."
+            f"No prompts were loaded from {parquet_path} using column {prompt_column_label!r}."
         )
-    return selected_column, prompts, total_rows
+    return prompt_column_label, prompts, total_rows
 
 
 def run_batch_generation(
@@ -592,6 +717,8 @@ def run_batch_generation(
         target_model_path=args.target_model_path,
         offset=args.offset,
         batch_size=args.batch_size,
+        prompt_column=args.prompt_column,
+        dataset_format=args.dataset_format,
         disable_chat_template=args.disable_chat_template,
         enable_thinking=args.enable_thinking,
     )
@@ -620,12 +747,21 @@ def run_batch_generation(
     print(f"generation_time_s: {elapsed_s:.3f}")
     print(f"avg_time_per_request_s: {elapsed_s / len(prompts):.3f}")
 
-    accept_lengths = []
+    total_accepted_tokens = 0
+    total_draft_tokens = 0
+    total_verify_ct = 0
     for batch_index, (prompt, output) in enumerate(zip(prompts, outputs)):
         meta_info = output.get("meta_info", {})
-        accept_length = meta_info.get("spec_accept_length")
-        if accept_length is not None:
-            accept_lengths.append(float(accept_length))
+        (
+            accept_length,
+            accept_rate,
+            accepted_tokens,
+            draft_tokens,
+            verify_ct,
+        ) = _get_real_verify_acceptance_stats(meta_info)
+        total_accepted_tokens += accepted_tokens
+        total_draft_tokens += draft_tokens
+        total_verify_ct += verify_ct
 
         print("=" * 80)
         print(f"sample_index: {batch_index}")
@@ -633,11 +769,18 @@ def run_batch_generation(
         print(f"prompt_preview: {prompt[: args.print_prompt_chars]}")
         print(f"output_text: {output.get('text', '')[: args.print_output_chars]}")
         print(f"spec_accept_length: {accept_length}")
+        print(f"spec_accept_rate: {accept_rate}")
 
-    if accept_lengths:
-        avg_accept_length = sum(accept_lengths) / len(accept_lengths)
+    if total_verify_ct > 0:
+        avg_accept_length = total_accepted_tokens / total_verify_ct
+        avg_accept_rate = (
+            total_accepted_tokens / total_draft_tokens
+            if total_draft_tokens > 0
+            else None
+        )
         print("=" * 80)
         print(f"avg_spec_accept_length: {avg_accept_length:.3f}")
+        print(f"avg_spec_accept_rate: {avg_accept_rate:.3f}")
 
 
 def main() -> None:
@@ -649,19 +792,23 @@ def main() -> None:
     try:
         draft_gpu_ids, target_gpu_ids = allocate_demo_gpus(args)
         args.draft_gpu_ids = draft_gpu_ids
+        control_endpoints, result_endpoints = _endpoint_lists(
+            DraftMeshIpcConfig.init_new(1)
+        )
         ray_runtime = init_demo_ray(RAY_NAMESPACE)
-        drafter_actor, drafter_actor_name = launch_drafter_actor(args)
+        drafter_actor = launch_drafter_actor(
+            args,
+            control_endpoints,
+            result_endpoints,
+        )
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(target_gpu_ids)
         verifier = launch_verifier(
             args.target_model_path,
-            drafter_actor_name,
-            RAY_NAMESPACE,
             args.target_tp_size,
             args.num_speculative_steps,
             args.num_speculative_steps + 1,
-            draft_backend_process_kwargs={
-                "ray_init_kwargs": ray_runtime.build_init_kwargs()
-            },
+            control_endpoints,
+            result_endpoints,
         )
         run_batch_generation(verifier, args)
     finally:

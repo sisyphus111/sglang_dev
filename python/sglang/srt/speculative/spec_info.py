@@ -54,13 +54,6 @@ class SpeculativeAlgorithm(Enum):
     def is_decoupled_draft(self) -> bool:
         return self == SpeculativeAlgorithm.DECOUPLED_DRAFT
 
-    def uses_target_verify_graph_capture(self) -> bool:
-        return (
-            self.is_eagle()
-            or self.is_standalone()
-            or self.is_ngram()
-            or self.is_decoupled_verify()
-        )
 
     def supports_spec_v2(self) -> bool:
         return self.is_eagle() or self.is_standalone()

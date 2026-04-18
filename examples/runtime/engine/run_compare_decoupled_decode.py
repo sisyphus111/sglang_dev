@@ -16,11 +16,16 @@ import ray
 import sglang as sgl
 
 from run_decoupled_spec import allocate_demo_gpus
+from run_decoupled_spec import _endpoint_lists
 from run_decoupled_spec import init_demo_ray
 from run_decoupled_spec import launch_drafter_actor
 from run_decoupled_spec import launch_verifier
 from run_decoupled_spec import RAY_NAMESPACE
-from run_decoupled_spec_batch import _maybe_append_chatml_generation_prompt
+from run_decoupled_spec_batch import (
+    _get_real_verify_acceptance_stats,
+    _maybe_append_chatml_generation_prompt,
+)
+from sglang.srt.speculative.decoupled_spec_io import DraftMeshIpcConfig
 
 DEFAULT_PROMPT = """Repeat the exact string `benchmark_token` for exactly 32 lines.
 
@@ -40,6 +45,7 @@ class ModeResult:
     generation_time_s: float
     output_text: str
     avg_accept_length: float | None = None
+    avg_accept_rate: float | None = None
     generated_tokens: int = 0
     token_throughput_tok_per_s: float = 0.0
 
@@ -139,11 +145,13 @@ def _generate_and_measure(engine, args: argparse.Namespace) -> ModeResult:
     token_throughput_tok_per_s = (
         generated_tokens / elapsed_s if elapsed_s > 0 else 0.0
     )
+    accept_length, accept_rate, *_ = _get_real_verify_acceptance_stats(meta_info)
     return ModeResult(
         mode="",
         generation_time_s=elapsed_s,
         output_text=output.get("text", ""),
-        avg_accept_length=meta_info.get("spec_accept_length"),
+        avg_accept_length=accept_length,
+        avg_accept_rate=accept_rate,
         generated_tokens=generated_tokens,
         token_throughput_tok_per_s=token_throughput_tok_per_s,
     )
@@ -167,19 +175,23 @@ def run_decoupled(args: argparse.Namespace) -> ModeResult:
     try:
         draft_gpu_ids, target_gpu_ids = allocate_demo_gpus(args)
         args.draft_gpu_ids = draft_gpu_ids
+        control_endpoints, result_endpoints = _endpoint_lists(
+            DraftMeshIpcConfig.init_new(1)
+        )
         ray_runtime = init_demo_ray(RAY_NAMESPACE)
-        drafter_actor, drafter_actor_name = launch_drafter_actor(args)
+        drafter_actor = launch_drafter_actor(
+            args,
+            control_endpoints,
+            result_endpoints,
+        )
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(target_gpu_ids)
         verifier = launch_verifier(
             args.target_model_path,
-            drafter_actor_name,
-            RAY_NAMESPACE,
             args.target_tp_size,
             args.num_speculative_steps,
             args.num_speculative_steps + 1,
-            draft_backend_process_kwargs={
-                "ray_init_kwargs": ray_runtime.build_init_kwargs()
-            },
+            control_endpoints,
+            result_endpoints,
         )
         result = _generate_and_measure(verifier, args)
         result.mode = "decoupled_spec"
@@ -208,7 +220,6 @@ def run_decode(args: argparse.Namespace) -> ModeResult:
         engine = build_decode_engine(args)
         result = _generate_and_measure(engine, args)
         result.mode = "decode"
-        result.avg_accept_length = 1
         return result
     finally:
         if engine is not None:
@@ -225,7 +236,8 @@ def print_summary(results: list[ModeResult]) -> None:
             f"generation_time_s={result.generation_time_s:.3f}, "
             f"generated_tokens={result.generated_tokens}, "
             f"token_throughput={result.token_throughput_tok_per_s:.3f} tok/s, "
-            f"avg_accept_length={result.avg_accept_length}"
+            f"avg_accept_length={result.avg_accept_length}, "
+            f"avg_accept_rate={result.avg_accept_rate}"
         )
 
 

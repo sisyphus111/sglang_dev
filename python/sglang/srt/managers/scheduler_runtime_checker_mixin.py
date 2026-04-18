@@ -19,32 +19,6 @@ logger = logging.getLogger(__name__)
 
 
 class SchedulerRuntimeCheckerMixin:
-    def _safe_optional_len(self, value) -> int:
-        if value is None:
-            return 0
-        return len(value)
-
-    def _format_draft_stateful_req_debug(self: Scheduler, req) -> dict:
-        return {
-            "rid": getattr(req, "rid", None),
-            "req_pool_idx": getattr(req, "req_pool_idx", None),
-            "kv_committed_len": getattr(req, "kv_committed_len", None),
-            "kv_allocated_len": getattr(req, "kv_allocated_len", None),
-            "cache_protected_len": getattr(req, "cache_protected_len", None),
-            "kv_committed_freed": getattr(req, "kv_committed_freed", None),
-            "kv_overallocated_freed": getattr(req, "kv_overallocated_freed", None),
-            "prefix_len": self._safe_optional_len(
-                getattr(req, "prefix_indices", None)
-            ),
-            "output_len": self._safe_optional_len(getattr(req, "output_ids", None)),
-        }
-
-    def _get_draft_session_debug_entries(self: Scheduler):
-        session_debug_entries = getattr(self.tree_cache, "session_debug_entries", None)
-        if session_debug_entries is None:
-            return []
-        return session_debug_entries()
-
     def _get_token_info(self: Scheduler):
         available_size = self.token_to_kv_pool_allocator.available_size()
         evictable_size = self.tree_cache.evictable_size()
@@ -176,42 +150,30 @@ class SchedulerRuntimeCheckerMixin:
     def _check_radix_cache_memory(self: Scheduler):
         _, _, available_size, evictable_size = self._get_token_info()
         protected_size = self.tree_cache.protected_size()
-        total_accounted_tokens = available_size + evictable_size + protected_size
-        memory_leak = total_accounted_tokens != self.max_total_num_tokens
-        token_msg = (
-            f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, "
-            f"{protected_size=}, {total_accounted_tokens=}\n"
+        memory_leak = (available_size + evictable_size) != (
+            # self.max_total_num_tokens
+            # if not self.enable_hierarchical_cache
+            # else self.max_total_num_tokens - protected_size
+            self.max_total_num_tokens
+            - protected_size
         )
+        token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
         return memory_leak, token_msg
-
-    def _get_req_uncached_size(self: Scheduler, req) -> int:
-        assert req.kv_committed_freed == req.kv_overallocated_freed
-        if req.req_pool_idx is None or req.kv_committed_freed:
-            return 0
-
-        allocated_len = req.kv_allocated_len
-        if self.page_size > 1:
-            allocated_len = ceil_align(allocated_len, self.page_size)
-            assert req.cache_protected_len % self.page_size == 0
-
-        return allocated_len - req.cache_protected_len
-
-    def _get_running_req_pool_size(self: Scheduler) -> int:
-        running_batch = getattr(self, "running_batch", None)
-        if running_batch is None:
-            return 0
-        return len(
-            {
-                req.req_pool_idx
-                for req in getattr(running_batch, "reqs", [])
-                if getattr(req, "req_pool_idx", None) is not None
-            }
-        )
 
     def _get_batch_uncached_size(self: Scheduler, batch: ScheduleBatch) -> int:
         ret = 0
         for req in batch.reqs:
-            ret += self._get_req_uncached_size(req)
+            assert req.kv_committed_freed == req.kv_overallocated_freed
+            uncached_len = 0
+            if not req.kv_committed_freed:
+                allocated_len = req.kv_allocated_len
+                if self.page_size > 1:
+                    allocated_len = ceil_align(allocated_len, self.page_size)
+                    assert req.cache_protected_len % self.page_size == 0
+                uncached_len = allocated_len - req.cache_protected_len
+
+            ret += uncached_len
+
         return ret
 
     def self_check_during_busy(self: Scheduler):
@@ -256,15 +218,11 @@ class SchedulerRuntimeCheckerMixin:
         else:
             req_total_size = self.req_to_token_pool.size
 
-        running_req_pool_size = self._get_running_req_pool_size()
-        accounted_req_pool_size = len(self.req_to_token_pool.free_slots) + running_req_pool_size
-        if accounted_req_pool_size != req_total_size:
+        if len(self.req_to_token_pool.free_slots) != req_total_size:
             msg = (
                 "req_to_token_pool memory leak detected!"
                 f"available_size={len(self.req_to_token_pool.free_slots)}, "
-                f"running_req_pool_size={running_req_pool_size}, "
-                f"accounted_size={accounted_req_pool_size}, "
-                f"total_size={req_total_size}\n"
+                f"total_size={self.req_to_token_pool.size}\n"
             )
             raise_error_or_warn(
                 self,
@@ -282,20 +240,6 @@ class SchedulerRuntimeCheckerMixin:
             memory_leak, token_msg = self._check_radix_cache_memory()
 
         if memory_leak:
-            sessions = self._get_draft_session_debug_entries()
-            waiting_reqs = [
-                self._format_draft_stateful_req_debug(req)
-                for req in getattr(self, "waiting_queue", [])
-                if getattr(req, "draft_stateful_mode", False)
-            ]
-            running_batch = getattr(self, "running_batch", None)
-            running_reqs = []
-            if running_batch is not None:
-                running_reqs = [
-                    self._format_draft_stateful_req_debug(req)
-                    for req in getattr(running_batch, "reqs", [])
-                    if getattr(req, "draft_stateful_mode", False)
-                ]
             msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
             raise_error_or_warn(
                 self,
