@@ -119,6 +119,16 @@ def _pin_actor_to_assigned_gpus(expected_num_gpus: int) -> list[str]:
 
 
 def parse_args() -> argparse.Namespace:
+    def str_to_bool(value: str | bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        normalized = value.lower()
+        if normalized in ("1", "true", "t", "yes", "y", "on"):
+            return True
+        if normalized in ("0", "false", "f", "no", "n", "off"):
+            return False
+        raise argparse.ArgumentTypeError(f"invalid boolean value: {value}")
+
     parser = argparse.ArgumentParser(
         description=(
             "Run decoupled speculation and normal decode on the same parquet "
@@ -263,6 +273,22 @@ def parse_args() -> argparse.Namespace:
         "--output-json",
         default=None,
         help="Optional path to write the complete benchmark result as JSON.",
+    )
+    parser.add_argument(
+        "--enable-decoupled-spec-trace",
+        nargs="?",
+        const=True,
+        default=False,
+        type=str_to_bool,
+        help=(
+            "Enable batch-level CSV tracing for decoupled speculative decoding. "
+            "Accepts either a bare flag or an explicit true/false value."
+        ),
+    )
+    parser.add_argument(
+        "--decoupled-spec-trace-dir",
+        default=None,
+        help="Directory for decoupled speculative decoding CSV trace files.",
     )
     return parser.parse_args()
 
@@ -830,6 +856,8 @@ class DraftEngineActor:
         speculative_num_steps: int,
         result_endpoint: str,
         deterministic: bool = False,
+        enable_decoupled_spec_trace: bool = False,
+        decoupled_spec_trace_dir: str | None = None,
     ):
         self.assigned_gpu_ids = _pin_actor_to_assigned_gpus(tp_size)
         port, reserved_socket = _reserve_tcp_port()
@@ -847,6 +875,8 @@ class DraftEngineActor:
             disable_radix_cache=True,
             chunked_prefill_size=-1,
             enable_deterministic_inference=deterministic,
+            enable_decoupled_spec_trace=enable_decoupled_spec_trace,
+            decoupled_spec_trace_dir=decoupled_spec_trace_dir,
         )
         self.engine = sgl.Engine(**engine_kwargs)
 
@@ -877,6 +907,8 @@ class TargetEngineActor:
         control_endpoints: list[str] | None = None,
         result_endpoints: list[str] | None = None,
         deterministic: bool = False,
+        enable_decoupled_spec_trace: bool = False,
+        decoupled_spec_trace_dir: str | None = None,
     ):
         self.mode = mode
         self.node_rank = node_rank
@@ -902,6 +934,8 @@ class TargetEngineActor:
                 speculative_num_draft_tokens=speculative_num_steps + 1,
                 decoupled_spec_control_endpoints=control_endpoints,
                 decoupled_spec_result_endpoints=result_endpoints,
+                enable_decoupled_spec_trace=enable_decoupled_spec_trace,
+                decoupled_spec_trace_dir=decoupled_spec_trace_dir,
             )
         elif mode != "decode":
             raise ValueError(f"Unsupported mode: {mode}")
@@ -959,6 +993,8 @@ def launch_draft_actors(
             speculative_num_steps=args.num_speculative_steps,
             result_endpoint=result_endpoint,
             deterministic=args.deterministic,
+            enable_decoupled_spec_trace=args.enable_decoupled_spec_trace,
+            decoupled_spec_trace_dir=args.decoupled_spec_trace_dir,
         )
         actors.append(actor)
     ready_infos = ray.get([actor.ready.remote() for actor in actors])
@@ -1014,6 +1050,10 @@ def launch_target_actors(
             control_endpoints=control_endpoints,
             result_endpoints=result_endpoints,
             deterministic=args.deterministic,
+            enable_decoupled_spec_trace=(
+                args.enable_decoupled_spec_trace and mode == "decoupled_spec"
+            ),
+            decoupled_spec_trace_dir=args.decoupled_spec_trace_dir,
         )
         actors.append(actor)
 
@@ -1269,6 +1309,8 @@ def build_result(
             "target_nnodes": target_nnodes,
             "target_gpus_per_node": target_gpus_per_node,
             "num_draft_replicas": args.num_draft_replicas,
+            "enable_decoupled_spec_trace": args.enable_decoupled_spec_trace,
+            "decoupled_spec_trace_dir": args.decoupled_spec_trace_dir,
         },
         "dataset": {
             "total_rows": total_rows,

@@ -423,10 +423,25 @@ class SchedulerOutputProcessorMixin:
             for message in self._broadcast_draft_control_messages(messages)
             if isinstance(message, DraftSync)
         ]
+        if getattr(self.decoupled_spec_tracer, "enabled", False):
+            self.decoupled_spec_tracer.record(
+                "drafter",
+                "recv_sync_batch",
+                batch_size=len(messages),
+                num_sync=len(messages),
+                request_ids=[message.request_id for message in messages],
+                committed_lens_by_req=[
+                    len(message.committed_output_ids) for message in messages
+                ],
+                output_lens_by_req=[
+                    len(message.committed_output_ids) for message in messages
+                ],
+            )
     
         if not messages:
             return
 
+        created_reqs: list[Req] = []
         for message in messages:
             draft_key = message.draft_key
             req = self.draft_req_table.get(draft_key)
@@ -440,6 +455,19 @@ class SchedulerOutputProcessorMixin:
             running_batch = self.running_batch
             if req not in self.waiting_queue and req not in running_batch.reqs:
                 self._add_request_to_queue(req)
+            created_reqs.append(req)
+        if getattr(self.decoupled_spec_tracer, "enabled", False):
+            self.decoupled_spec_tracer.record(
+                "drafter",
+                "create_draft_req_batch",
+                batch_size=len(created_reqs),
+                num_sync=len(messages),
+                request_ids=[req.draft_key.request_id for req in created_reqs],
+                committed_lens_by_req=[
+                    int(req.verifier_committed_prefix_len) for req in created_reqs
+                ],
+                output_lens_by_req=[len(req.output_ids) for req in created_reqs],
+            )
 
 
     def _draft_apply_commits_and_maybe_emit(
@@ -514,6 +542,8 @@ class SchedulerOutputProcessorMixin:
         1. apply DraftClose message: release the draft req
         2. apply VerifyCommit message to the req, and collect & send new draft token
         """
+        trace_enabled = getattr(self.decoupled_spec_tracer, "enabled", False)
+        trace_start_ns = time.perf_counter_ns() if trace_enabled else 0
         # build draft_key -> req mapping
         current_req_by_key: dict[DraftReqKey, Req] = {}
         for req in batch.reqs:
@@ -556,6 +586,39 @@ class SchedulerOutputProcessorMixin:
                 # if the req is not in current batch, cache the pending VerifyCommit message
                 req.draft_pending_verify_commits.append(message)
 
+        if trace_enabled:
+            commit_messages = [
+                message
+                for messages in commits_by_key.values()
+                for message in messages
+            ]
+            close_messages = [
+                message
+                for message in control_messages
+                if isinstance(message, DraftClose)
+            ]
+            self.decoupled_spec_tracer.record(
+                "drafter",
+                "apply_commit_batch",
+                forward_mode=str(batch.forward_mode),
+                batch_size=len(batch.reqs),
+                num_commit=len(commit_messages),
+                request_ids=[message.request_id for message in commit_messages],
+                committed_lens_by_req=[
+                    int(message.bonus_token_pos) + 1
+                    for message in commit_messages
+                ],
+            )
+            self.decoupled_spec_tracer.record(
+                "drafter",
+                "post_decode_control_batch",
+                forward_mode=str(batch.forward_mode),
+                batch_size=len(batch.reqs),
+                num_commit=len(commit_messages),
+                num_close=len(close_messages),
+                request_ids=[message.request_id for message in control_messages],
+            )
+
         # apply VerifyCommit and send new draft token
         stream_outputs: list[DraftTailStreamOutput] = []
         for req_batch_idx, req in enumerate(batch.reqs):
@@ -575,6 +638,29 @@ class SchedulerOutputProcessorMixin:
             )
             if stream_output is not None:
                 stream_outputs.append(stream_output)
+        if trace_enabled:
+            counts_by_request: dict[str, int] = {}
+            for output in stream_outputs:
+                counts_by_request[output.request_id] = (
+                    counts_by_request.get(output.request_id, 0) + 1
+                )
+            request_ids = list(counts_by_request.keys())
+            self.decoupled_spec_tracer.record(
+                "drafter",
+                "emit_tail_batch",
+                forward_mode=str(batch.forward_mode),
+                duration_ms=(time.perf_counter_ns() - trace_start_ns) / 1_000_000,
+                batch_size=len(batch.reqs),
+                num_stream_outputs=len(stream_outputs),
+                request_ids=request_ids,
+                emitted_token_lens_by_req=[
+                    counts_by_request[request_id] for request_id in request_ids
+                ],
+                committed_lens_by_req=[
+                    int(req.verifier_committed_prefix_len) for req in batch.reqs
+                ],
+                output_lens_by_req=[len(req.output_ids) for req in batch.reqs],
+            )
         return stream_outputs
 
     def _get_storage_backend_type(self) -> str:

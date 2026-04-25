@@ -482,6 +482,8 @@ class ServerArgs:
     speculative_draft_model_quantization: Optional[str] = None
     decoupled_spec_control_endpoints: Optional[List[str]] = None
     decoupled_spec_result_endpoints: Optional[List[str]] = None
+    enable_decoupled_spec_trace: bool = False
+    decoupled_spec_trace_dir: Optional[str] = None
 
     # Speculative decoding (ngram)
     speculative_ngram_min_match_window_size: int = 1
@@ -4117,6 +4119,20 @@ class ServerArgs:
             help=(
                 "JSON list of drafter->verifier result ZMQ endpoints for "
                 "decoupled speculative decoding."
+            ),
+        )
+        parser.add_argument(
+            "--enable-decoupled-spec-trace",
+            action="store_true",
+            help="Enable batch-level CSV tracing for decoupled speculative decoding.",
+        )
+        parser.add_argument(
+            "--decoupled-spec-trace-dir",
+            type=str,
+            default=ServerArgs.decoupled_spec_trace_dir,
+            help=(
+                "Directory for decoupled speculative decoding CSV trace files. "
+                "Defaults to ./decoupled_spec_trace when tracing is enabled."
             ),
         )
 

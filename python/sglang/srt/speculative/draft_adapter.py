@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
+from typing import Any
 
 import zmq
 
@@ -42,6 +44,7 @@ class DraftAdapterThread:
     _closed: threading.Event = field(default_factory=threading.Event)
     _wakeup: threading.Event = field(default_factory=threading.Event)
     _thread: threading.Thread | None = None
+    tracer: Any = None
 
     def __post_init__(self) -> None:
         if self.context is None or self.ipc_config is None:
@@ -95,7 +98,14 @@ class DraftAdapterThread:
 
         while True:
             try:
+                trace_enabled = getattr(getattr(self, "tracer", None), "enabled", False)
+                start_ns = time.perf_counter_ns() if trace_enabled else 0
                 message = self.control_recv_socket.recv_pyobj(zmq.NOBLOCK)
+                recv_duration_ms = (
+                    (time.perf_counter_ns() - start_ns) / 1_000_000
+                    if trace_enabled
+                    else 0
+                )
             except zmq.error.ContextTerminated:
                 raise
             except zmq.ZMQError:
@@ -115,9 +125,17 @@ class DraftAdapterThread:
             if control_messages:
                 with self._pending_lock:
                     self._pending_controls.extend(control_messages)
+            if trace_enabled:
+                self._record_control_batch(
+                    "recv_control_batch",
+                    control_batch,
+                    duration_ms=recv_duration_ms,
+                )
         return did_work
 
     def drain_sync_messages(self) -> list[DraftSync]:
+        trace_enabled = getattr(getattr(self, "tracer", None), "enabled", False)
+        start_ns = time.perf_counter_ns() if trace_enabled else 0
         sync_messages: list[DraftSync] = []
         remaining_controls: deque[DraftControlMessage] = deque()
         with self._pending_lock:
@@ -128,9 +146,17 @@ class DraftAdapterThread:
                 else:
                     remaining_controls.append(message)
             self._pending_controls = remaining_controls
+        if trace_enabled:
+            self._record_messages(
+                "drain_sync_batch",
+                sync_messages,
+                duration_ms=(time.perf_counter_ns() - start_ns) / 1_000_000,
+            )
         return sync_messages
 
     def drain_post_result_messages(self) -> list[VerifyCommit | DraftClose]:
+        trace_enabled = getattr(getattr(self, "tracer", None), "enabled", False)
+        start_ns = time.perf_counter_ns() if trace_enabled else 0
         post_result_messages: list[VerifyCommit | DraftClose] = []
         remaining_controls: deque[DraftControlMessage] = deque()
         with self._pending_lock:
@@ -141,13 +167,27 @@ class DraftAdapterThread:
                 else:
                     remaining_controls.append(message)
             self._pending_controls = remaining_controls
+        if trace_enabled:
+            self._record_messages(
+                "drain_post_result_batch",
+                post_result_messages,
+                duration_ms=(time.perf_counter_ns() - start_ns) / 1_000_000,
+            )
         return post_result_messages
 
     def submit_draft_results(self, results: list[DraftTailStreamOutput]) -> None:
         if not results:
             return
+        trace_enabled = getattr(getattr(self, "tracer", None), "enabled", False)
+        start_ns = time.perf_counter_ns() if trace_enabled else 0
         self._outgoing_results.put(list(results))
         self._wakeup.set()
+        if trace_enabled:
+            self._record_draft_results(
+                "enqueue_draft_result_batch",
+                results,
+                duration_ms=(time.perf_counter_ns() - start_ns) / 1_000_000,
+            )
 
     def _drain_outgoing_results(self) -> bool:
         did_work = False
@@ -175,6 +215,8 @@ class DraftAdapterThread:
                     f"Missing result socket for dst_verifier_rank={dst_verifier_rank}"
                 )
 
+            trace_enabled = getattr(getattr(self, "tracer", None), "enabled", False)
+            start_ns = time.perf_counter_ns() if trace_enabled else 0
             socket.send_pyobj(
                 DraftMeshMessage.from_tail_stream_output_batch(
                     DraftTailStreamOutputBatch(
@@ -183,6 +225,76 @@ class DraftAdapterThread:
                     )
                 )
             )
+            if trace_enabled:
+                self._record_draft_results(
+                    "send_result_batch",
+                    group,
+                    dst_verifier_rank=dst_verifier_rank,
+                    duration_ms=(time.perf_counter_ns() - start_ns) / 1_000_000,
+                )
+
+    def _record_control_batch(
+        self,
+        op: str,
+        batch: DraftControlBatch,
+        *,
+        duration_ms: float,
+    ) -> None:
+        if not getattr(getattr(self, "tracer", None), "enabled", False):
+            return
+        messages = iter_control_batch_messages(batch)
+        self._record_messages(op, messages, duration_ms=duration_ms)
+
+    def _record_messages(
+        self,
+        op: str,
+        messages: list[DraftControlMessage],
+        *,
+        duration_ms: float,
+    ) -> None:
+        if not getattr(getattr(self, "tracer", None), "enabled", False):
+            return
+        self.tracer.record(
+            "draft_adapter",
+            op,
+            duration_ms=duration_ms,
+            drafter_rank=int(self.drafter_rank),
+            batch_size=len(messages),
+            num_sync=sum(isinstance(message, DraftSync) for message in messages),
+            num_commit=sum(isinstance(message, VerifyCommit) for message in messages),
+            num_close=sum(isinstance(message, DraftClose) for message in messages),
+            request_ids=[message.request_id for message in messages],
+        )
+
+    def _record_draft_results(
+        self,
+        op: str,
+        results: list[DraftTailStreamOutput],
+        *,
+        duration_ms: float,
+        dst_verifier_rank: int | None = None,
+    ) -> None:
+        if not getattr(getattr(self, "tracer", None), "enabled", False):
+            return
+        counts_by_request: dict[str, int] = {}
+        for result in results:
+            counts_by_request[result.request_id] = (
+                counts_by_request.get(result.request_id, 0) + 1
+            )
+        request_ids = list(counts_by_request.keys())
+        self.tracer.record(
+            "draft_adapter",
+            op,
+            duration_ms=duration_ms,
+            drafter_rank=int(self.drafter_rank),
+            dst_verifier_rank=dst_verifier_rank,
+            batch_size=len(request_ids),
+            num_stream_outputs=len(results),
+            request_ids=request_ids,
+            emitted_token_lens_by_req=[
+                counts_by_request[request_id] for request_id in request_ids
+            ],
+        )
 
     def _run(self) -> None:
         while not self._closed.is_set():

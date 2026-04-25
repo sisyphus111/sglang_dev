@@ -56,6 +56,8 @@ def build_spec_only_result(
             "target_nnodes": target_nnodes,
             "target_gpus_per_node": target_gpus_per_node,
             "num_draft_replicas": args.num_draft_replicas,
+            "enable_decoupled_spec_trace": args.enable_decoupled_spec_trace,
+            "decoupled_spec_trace_dir": args.decoupled_spec_trace_dir,
         },
         "dataset": {
             "total_rows": total_rows,
